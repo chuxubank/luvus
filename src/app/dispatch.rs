@@ -3956,6 +3956,31 @@ impl App {
                 self.show_toast(text.chars().take(120).collect::<String>());
                 Ok(json!({"type":"ok"}))
             }
+            "ui.agent_title.push" => {
+                let titles = p.get("titles").and_then(Value::as_array).ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "titles must be a JSON array".to_string(),
+                    )
+                })?;
+                if titles.len() > MAX_AGENT_ROW_TITLES {
+                    return Err(("invalid_request".to_string(), "too many titles".to_string()));
+                }
+                let mut changed = false;
+                for item in titles {
+                    changed |= self.apply_agent_row_title_item(item)?;
+                }
+                Ok(json!({"type":"ok", "changed": changed}))
+            }
+            "ui.agent_title.clear" => {
+                let pane = match p.get("pane") {
+                    Some(value) => Some(self.parse_agent_row_title_pane(value)?),
+                    None => None,
+                };
+                let session = agent_row_title_session(p.get("agent"), p.get("session_id"))?;
+                let changed = self.clear_agent_row_titles(pane, session);
+                Ok(json!({"type":"ok", "changed": changed}))
+            }
             "ui.dock.push" => {
                 let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if id.is_empty() {
@@ -6461,15 +6486,33 @@ impl App {
             })
     }
 
-    /// The pane's live session title (the OSC title the agent set), trimmed, if
-    /// non-empty. The AGENTS sidebar shows it in place of the meta line when the
-    /// "show agent session title" setting is on (`config.layout.agent_title`).
+    /// The pane's live session title, trimmed, if non-empty. OSC title wins;
+    /// otherwise a module-provided title (`ui.agent_title.push`). Luvus pane
+    /// aliases (`=name`) are never used as a title. The AGENTS sidebar shows
+    /// this in place of the meta line when the "show agent session title"
+    /// setting is on (`config.layout.agent_title`).
     pub(crate) fn pane_title(&self, pane: PaneId) -> Option<String> {
-        self.panes
+        if let Some(title) = self
+            .panes
             .get(&pane)
             .and_then(|p| p.engine.lock().ok().and_then(|e| e.title()))
             .map(|s| strip_title_icon(&s))
             .filter(|s| !s.is_empty())
+        {
+            return Some(title);
+        }
+        if let Some(title) = self
+            .agent_title_panes
+            .get(&pane)
+            .map(|title| strip_title_icon(title))
+            .filter(|title| !title.is_empty())
+        {
+            return Some(title);
+        }
+        let session = self.status.get(&pane)?.agent_session.as_ref()?;
+        self.agent_row_title_for_session(&session.agent, &session.session_id)
+            .map(strip_title_icon)
+            .filter(|title| !title.is_empty())
     }
 
     /// Whether `pane` currently hosts a recognised agent (detection) or a bound
@@ -6927,6 +6970,100 @@ fn agent_fork_error(err: AgentForkError) -> (String, String) {
         AgentForkError::SpawnFailed => ("spawn_failed", "fork pane failed to start"),
     };
     (code.to_string(), message.to_string())
+}
+
+const MAX_AGENT_ROW_TITLE_BYTES: usize = 256;
+const MAX_AGENT_ROW_TITLES: usize = 256;
+
+fn sanitize_agent_row_title(raw: &str) -> Result<Option<String>, (String, String)> {
+    let cleaned: String = raw
+        .chars()
+        .map(|character| {
+            if matches!(character, '\n' | '\r') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_AGENT_ROW_TITLE_BYTES {
+        return Err(("invalid_request".into(), "title is too long".into()));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn agent_row_title_session(
+    agent: Option<&Value>,
+    session_id: Option<&Value>,
+) -> Result<Option<(String, String)>, (String, String)> {
+    match (agent, session_id) {
+        (None, None) => Ok(None),
+        (Some(agent), Some(session_id)) => {
+            let agent = agent
+                .as_str()
+                .map(str::trim)
+                .filter(|agent| !agent.is_empty())
+                .ok_or_else(|| ("invalid_request".into(), "agent is required".into()))?;
+            let session_id = session_id.as_str().unwrap_or("");
+            if !crate::agent::safe_session_id(session_id) {
+                return Err(("invalid_request".into(), "invalid session_id".into()));
+            }
+            Ok(Some((agent.to_string(), session_id.to_string())))
+        }
+        _ => Err((
+            "invalid_request".into(),
+            "agent and session_id must be supplied together".into(),
+        )),
+    }
+}
+
+impl App {
+    fn parse_agent_row_title_pane(&self, value: &Value) -> Result<PaneId, (String, String)> {
+        let id = value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .and_then(|id| u32::try_from(id).ok())
+            .map(PaneId)
+            .ok_or_else(|| ("invalid_request".into(), "invalid pane".into()))?;
+        if !self.panes.contains_key(&id) {
+            return Err(("not_found".into(), "pane not found".into()));
+        }
+        Ok(id)
+    }
+
+    fn apply_agent_row_title_item(&mut self, item: &Value) -> Result<bool, (String, String)> {
+        if !item.is_object() {
+            return Err((
+                "invalid_request".into(),
+                "each title must be an object".into(),
+            ));
+        }
+        let title =
+            sanitize_agent_row_title(item.get("title").and_then(Value::as_str).unwrap_or(""))?;
+        let pane = match item.get("pane") {
+            Some(value) => Some(self.parse_agent_row_title_pane(value)?),
+            None => None,
+        };
+        let session = agent_row_title_session(item.get("agent"), item.get("session_id"))?;
+        if pane.is_none() && session.is_none() {
+            return Err((
+                "invalid_request".into(),
+                "each title needs pane or agent+session_id".into(),
+            ));
+        }
+        let mut changed = false;
+        if let Some(pane) = pane {
+            changed |= self.set_agent_row_title_for_pane(pane, title.clone());
+        }
+        if let Some((agent, session_id)) = session {
+            changed |= self.set_agent_row_title_for_session(agent, session_id, title);
+        }
+        Ok(changed)
+    }
 }
 
 /// Strip a leading decorative icon/glyph that some agents prepend to their OSC
@@ -8506,6 +8643,63 @@ command = ["true"]
         );
         app.module_set_enabled("you.ci", false).unwrap();
         assert!(!app.bar.widgets.contains_key("you.ci:status"));
+    }
+
+    #[test]
+    fn agent_row_titles_are_module_provided_and_never_use_alias() {
+        let _env = crate::persist::test_env("agent-row-titles");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        {
+            let status = app.status.get_mut(&pane).unwrap();
+            status.agent = "pi".into();
+            status.agent_session = Some(crate::app::AgentSession {
+                agent: "pi".into(),
+                session_id: "sess-1".into(),
+            });
+        }
+        app.agent_names.insert("chezmoi".into(), pane);
+        let pushed = app
+            .dispatch(
+                "ui.agent_title.push",
+                &json!({
+                    "titles": [
+                        {"pane": pane.0.to_string(), "title": "Ship desktop"},
+                        {"agent": "pi", "session_id": "old-1", "title": "History title"}
+                    ]
+                }),
+            )
+            .unwrap();
+        assert_eq!(pushed["changed"], true);
+        assert_eq!(app.pane_title(pane).as_deref(), Some("Ship desktop"));
+        assert_eq!(app.agent_name_for(pane), Some("chezmoi"));
+        assert_eq!(
+            app.agent_row_title_for_session("pi", "old-1"),
+            Some("History title")
+        );
+        app.dispatch(
+            "ui.agent_title.push",
+            &json!({"titles": [{"pane": pane.0.to_string(), "title": ""}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.pane_title(pane).as_deref(),
+            None,
+            "clearing the pane title must not fall back to =alias"
+        );
+        app.dispatch(
+            "ui.agent_title.clear",
+            &json!({"agent":"pi","session_id":"old-1"}),
+        )
+        .unwrap();
+        assert!(app.agent_row_title_for_session("pi", "old-1").is_none());
+        assert!(app
+            .dispatch(
+                "ui.agent_title.push",
+                &json!({"titles": [{"title": "no target"}]})
+            )
+            .is_err());
     }
 
     #[test]
