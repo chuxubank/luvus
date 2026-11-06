@@ -2201,6 +2201,7 @@ fn content_fence_app() -> (
         &[("LUVUS_CONTENT_FENCE_CHILD".into(), "1".into())],
         app.config.scrollback_bytes(),
         app.pane_appearance,
+        app.host_graphics.clone(),
     )
     .unwrap();
     app.panes.insert(pane, child);
@@ -2547,6 +2548,7 @@ fn title_engine(
         tx,
         1024 * 1024,
         PaneAppearance::default(),
+        crate::terminal::graphics::HostGraphics::default(),
     );
     app.panes.get_mut(&pane).unwrap().engine = engine.clone();
     engine

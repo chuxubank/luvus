@@ -725,6 +725,7 @@ mod tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         )
         .unwrap();
         let (child_gate, mut release) = UnixStream::pair().unwrap();

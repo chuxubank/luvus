@@ -1450,6 +1450,7 @@ impl App {
             | AppEvent::ClientShellWorkspaceMenu { .. }
             | AppEvent::ClientOpenWorkspacePicker { .. }
             | AppEvent::ClientCellPixels { .. }
+            | AppEvent::ClientGraphicsSent { .. }
             | AppEvent::ClientInput { .. }
             | AppEvent::ClientClipboardSucceeded { .. }
             | AppEvent::Shutdown => false,
