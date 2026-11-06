@@ -3420,6 +3420,7 @@ mod tests {
             truncated: false,
             omitted_lines: 0,
             hunks,
+            presentation: None,
         });
         let loaded = crate::diff::LoadedDiff::prepare(diff, Vec::new());
         let token = match app.views.get(&id) {
@@ -3561,6 +3562,7 @@ mod tests {
             binary: false,
             truncated: false,
             omitted_lines: 0,
+            presentation: None,
             hunks: vec![
                 DiffHunk {
                     id: "h1".into(),
