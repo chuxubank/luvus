@@ -4658,10 +4658,11 @@ impl App {
     /// that it queued something — a render pass runs constantly and must not
     /// lock every engine to discover there is no image.
     pub fn take_pane_graphics(&mut self) -> Vec<Vec<u8>> {
-        if !self.host_graphics.take_pending() {
-            return Vec::new();
+        let pending = self.host_graphics.take_pending();
+        let mut commands = self.host_graphics.take_released();
+        if !pending {
+            return commands;
         }
-        let mut commands = Vec::new();
         for pane in self.panes.values() {
             if let Ok(mut engine) = pane.engine.lock() {
                 if engine.has_graphics() {
@@ -9786,6 +9787,12 @@ impl App {
         self.backend_published_revisions.remove(&id);
         self.agent_title_panes.remove(&id);
         self.cancel_backend_revision_waits(id);
+        if let Some(pane) = self.panes.get(&id) {
+            if let Ok(mut engine) = pane.engine.lock() {
+                let deletes = engine.release_graphics();
+                self.host_graphics.push_released(deletes);
+            }
+        }
         let reported = self
             .reported_usage
             .iter()
