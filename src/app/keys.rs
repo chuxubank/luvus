@@ -374,6 +374,8 @@ impl Cmd {
             Cmd::NextPane => ";",
             Cmd::FocusBack => "[",
             Cmd::FocusForward => "]",
+            // Right-hand cluster on the period key: `.` is Blocked, `'` is
+            // Working and needs no Shift, and `>` is Shift+. for Done.
             Cmd::NextAttention => ".",
             // Agent states are one right-hand group. Working is unshifted;
             // Done is Shift plus period. The pane menu is the key above Tab.
