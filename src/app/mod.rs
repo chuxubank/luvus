@@ -2674,10 +2674,6 @@ pub struct App {
     pub theme: Theme,
     /// Appearance reported to programs running inside panes.
     pane_appearance: crate::terminal::appearance::PaneAppearance,
-    /// Whether any attached client's terminal can draw images. Shared with
-    /// every pane's engine, which answers the kitty graphics support query
-    /// synchronously while parsing child output.
-    host_graphics: crate::terminal::graphics::HostGraphics,
     /// Last foreground-client palette used to resolve the virtual Terminal theme.
     probed_appearance: Option<crate::terminal::appearance::PaneAppearance>,
     /// Built-in, installed, and virtual themes in Settings display order.
@@ -3468,7 +3464,6 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
-        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
         let shell = crate::platform::resolve_shell(&config.shell);
@@ -3491,7 +3486,6 @@ impl App {
             &shell,
             config.scrollback_bytes(),
             pane_appearance,
-            host_graphics.clone(),
         )?;
         let command = pane.command.clone();
         let mut panes = HashMap::new();
@@ -3538,7 +3532,6 @@ impl App {
             closed_workspace_paths: Vec::new(),
             theme,
             pane_appearance,
-            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
@@ -3899,7 +3892,6 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
-        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let keymap = keys::build_keymap(&config.keybindings);
         let direct_keymap = keys::build_direct_keymap(&config.direct_keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
@@ -4103,7 +4095,6 @@ impl App {
                             &app_tx,
                             history_budget_bytes,
                             pane_appearance,
-                            host_graphics.clone(),
                         )
                     });
                     let (pane, module_rec) = match restored {
@@ -4137,7 +4128,6 @@ impl App {
                                     argv,
                                     history_budget_bytes,
                                     pane_appearance,
-                                    host_graphics.clone(),
                                 )
                                 .ok(),
                                 None => Some(Pane::spawn_restored(
@@ -4151,7 +4141,6 @@ impl App {
                                     &shell,
                                     history_budget_bytes,
                                     pane_appearance,
-                                    host_graphics.clone(),
                                 )),
                             };
                             let Some(pane) = pane else {
@@ -4282,7 +4271,6 @@ impl App {
             closed_workspace_paths,
             theme,
             pane_appearance,
-            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
@@ -4622,82 +4610,6 @@ impl App {
             self.downsample = true;
             self.theme = self.theme.to_256();
         }
-    }
-
-    /// Record support for the single display in monolithic local mode.
-    pub fn set_host_graphics(&mut self, supported: bool) {
-        self.host_graphics.set(supported);
-    }
-
-    /// Share foreground negotiation and any-renderer delivery with every pane.
-    pub(crate) fn set_host_graphics_clients(&mut self, foreground: bool, any_renderer: bool) {
-        self.host_graphics.set_clients(foreground, any_renderer);
-    }
-
-    /// Whether the foreground display can acknowledge a new image query.
-    pub fn host_graphics_available(&self) -> bool {
-        self.host_graphics.query_supported()
-    }
-
-    /// Record how big a cell is on the terminal showing the attached clients.
-    ///
-    /// A pane reports its size in pixels as well as in cells, and that pixel
-    /// figure is derived from this. It only changes when the set of attached
-    /// clients does, so the panes are told once rather than on every frame.
-    pub fn set_host_cell_size(
-        &mut self,
-        cell_size: Option<crate::terminal::theme_probe::CellSize>,
-    ) {
-        if !self.host_graphics.set_cell_size(cell_size) {
-            return;
-        }
-        for pane in self.panes.values() {
-            pane.refresh_window_size();
-        }
-    }
-
-    /// Take the kitty graphics commands every pane has waiting.
-    ///
-    /// Returns nothing, without touching a pane, unless one of them signalled
-    /// that it queued something — a render pass runs constantly and must not
-    /// lock every engine to discover there is no image.
-    pub fn take_pane_graphics(&mut self) -> Vec<Vec<u8>> {
-        let pending = self.host_graphics.take_pending();
-        let mut commands = self.host_graphics.take_released();
-        if !pending {
-            return commands;
-        }
-        for pane in self.panes.values() {
-            if let Ok(mut engine) = pane.engine.lock() {
-                if engine.has_graphics() {
-                    commands.append(&mut engine.take_graphics());
-                }
-            }
-        }
-        commands
-    }
-
-    /// Graphics produced since collection invalidate a drawing client's live
-    /// projection: its cells may already name an image not in that backlog.
-    pub(crate) fn pane_graphics_pending(&self) -> bool {
-        self.host_graphics.pending()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn host_graphics_for_test(&self) -> crate::terminal::graphics::HostGraphics {
-        self.host_graphics.clone()
-    }
-
-    /// The images every pane's grid still refers to, for a client that has just
-    /// attached and is about to be sent cells naming them.
-    pub fn pane_graphics_history(&self) -> Vec<Vec<u8>> {
-        let mut commands = Vec::new();
-        for pane in self.panes.values() {
-            if let Ok(engine) = pane.engine.lock() {
-                commands.append(&mut engine.retained_graphics());
-            }
-        }
-        commands
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.
@@ -5565,7 +5477,6 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
-            self.host_graphics.clone(),
         ) {
             Ok(pane) => {
                 let cmd = pane.command.clone();
@@ -5621,7 +5532,6 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
-            self.host_graphics.clone(),
         );
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
@@ -5655,7 +5565,6 @@ impl App {
                 a,
                 history_budget_bytes,
                 self.pane_appearance,
-                self.host_graphics.clone(),
             ),
             None => Pane::spawn(
                 id,
@@ -5667,7 +5576,6 @@ impl App {
                 &shell,
                 history_budget_bytes,
                 self.pane_appearance,
-                self.host_graphics.clone(),
             ),
         };
         match spawned {
@@ -9952,12 +9860,6 @@ impl App {
         self.backend_published_revisions.remove(&id);
         self.agent_title_panes.remove(&id);
         self.cancel_backend_revision_waits(id);
-        if let Some(pane) = self.panes.get(&id) {
-            if let Ok(mut engine) = pane.engine.lock() {
-                let deletes = engine.release_graphics();
-                self.host_graphics.push_released(deletes);
-            }
-        }
         let reported = self
             .reported_usage
             .iter()
@@ -10450,7 +10352,6 @@ fn worktree_membership_probe(
 
 /// Re-spawn a saved module pane if its module is still installed + runnable;
 /// returns the pane + its tracking record, or `None` to fall back to a shell.
-#[allow(clippy::too_many_arguments)]
 fn restore_module_pane(
     module_runtime: (&crate::module::ModuleRegistry, &HashMap<String, String>),
     mid: &str,
@@ -10459,7 +10360,6 @@ fn restore_module_pane(
     app_tx: &Sender<AppEvent>,
     history_budget_bytes: usize,
     appearance: crate::terminal::appearance::PaneAppearance,
-    host_graphics: crate::terminal::graphics::HostGraphics,
 ) -> Option<(Pane, crate::module::ModulePaneRecord)> {
     let (modules, module_tokens) = module_runtime;
     let m = modules.find(mid).filter(|m| m.is_runnable())?;
@@ -10488,7 +10388,6 @@ fn restore_module_pane(
         &env,
         history_budget_bytes,
         appearance,
-        host_graphics,
     )
     .ok()?;
     Some((
@@ -11141,7 +11040,6 @@ mod tests {
             &shell,
             app.config.scrollback_bytes(),
             app.pane_appearance,
-            app.host_graphics.clone(),
         )
         .unwrap();
         app.worktree_deletes_inflight.insert(
@@ -11713,7 +11611,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -11758,7 +11655,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -11829,7 +11725,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -11919,7 +11814,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -11978,7 +11872,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12029,7 +11922,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12122,7 +12014,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12182,7 +12073,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12265,7 +12155,6 @@ mod tests {
             sender,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12317,7 +12206,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12384,7 +12272,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12430,7 +12317,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12473,7 +12359,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12534,7 +12419,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12583,7 +12467,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12631,7 +12514,6 @@ mod tests {
                 tx,
                 4 * 1024 * 1024,
                 PaneAppearance::default(),
-                crate::terminal::graphics::HostGraphics::default(),
             );
             app.panes
                 .get_mut(&pane)
@@ -12712,7 +12594,6 @@ mod tests {
                 tx,
                 1024 * 1024,
                 PaneAppearance::default(),
-                crate::terminal::graphics::HostGraphics::default(),
             );
             app.panes
                 .get_mut(&pane)
@@ -12767,7 +12648,6 @@ mod tests {
                 tx,
                 1024 * 1024,
                 PaneAppearance::default(),
-                crate::terminal::graphics::HostGraphics::default(),
             );
             app.panes
                 .get_mut(&pane)
@@ -12842,7 +12722,6 @@ mod tests {
             tx,
             1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -12896,7 +12775,6 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
-            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes
             .get_mut(&pane)
@@ -17658,9 +17536,7 @@ fi
         // The bare middle of the same border row (between the title and the
         // buttons) is not chrome, so it still grabs the divider to resize.
         let divider_row = zoom.y;
-        let bare = (title.right()..zoom.x)
-            .find(|&x| !app.on_pane_chrome(x, divider_row))
-            .expect("there is a bare seam between title and zoom");
+        let bare = 60u16; // mid-width: past the title, before the right-edge buttons
         assert!(
             !app.on_pane_chrome(bare, divider_row),
             "the chosen seam cell is genuinely not chrome"
