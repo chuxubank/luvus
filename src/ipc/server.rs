@@ -3,7 +3,7 @@
 //! Input arrives from clients; the JSON API also runs here. See docs/03, docs/08.
 
 use crate::ipc::transport::{self, Conn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -250,6 +250,10 @@ struct ClientState {
     last_shell_workspaces: Vec<protocol::ShellWorkspace>,
     shell_dock_dirty: bool,
     clipboard_receipt: Option<u64>,
+    graphics: crate::terminal::kitty_graphics::HostGraphicsCache,
+    graphics_supported: bool,
+    /// More image bytes were left for a later frame after the last send.
+    graphics_pending: bool,
 }
 
 #[derive(Default)]
@@ -296,7 +300,14 @@ impl ClientState {
             last_shell_workspaces: Vec::new(),
             shell_dock_dirty: false,
             clipboard_receipt: None,
+            graphics: crate::terminal::kitty_graphics::HostGraphicsCache::default(),
+            graphics_supported: false,
+            graphics_pending: false,
         }
+    }
+
+    fn graphics_usable(&self) -> bool {
+        self.graphics_supported && self.cell_width_px > 0 && self.cell_height_px > 0
     }
 
     fn send_control(&self, msg: ServerMessage) -> Result<(), ()> {
@@ -471,6 +482,7 @@ pub fn run() -> Result<()> {
         // Otherwise sleep until the next real deadline, or block on the
         // channel when nothing is due (PTY/API/client/signal wake the loop).
         let now = Instant::now();
+        schedule_client_frame_debt(&clients, &mut render_request);
         let rearm_interval = pty_rearm_interval(
             app.has_history_maintenance(),
             crate::ipc::api::active_terminal_streams(),
@@ -719,14 +731,9 @@ pub fn run() -> Result<()> {
         // A forced redraw (resize / focus-regained / external damage) must render
         // even if nothing else changed this tick — and so must a client that is
         // waiting on its full-frame resync (see `needs_render`).
-        let any_behind = clients
-            .values()
-            .any(|client| client.interest != SurfaceInterest::Suspended && client.behind);
+        schedule_client_frame_debt(&clients, &mut render_request);
         if app.force_redraw {
             render_request.record(RenderCause::ForcedRepair);
-        }
-        if any_behind {
-            render_request.record(RenderCause::ClientResync);
         }
 
         let projection_causes = RenderCause::UserInterface.bit()
@@ -1040,11 +1047,27 @@ fn apply(
             client.cell_width_px = cell_width_px;
             client.cell_height_px = cell_height_px;
             // Passive metadata: only the interactive client's display may define
-            // the geometry shared state uses, and it never forces a repaint.
+            // the geometry shared state uses. A size that arrives after the host
+            // agreed to draw is what lets the next frame place images.
             if *foreground == Some(id) {
                 app.set_client_cell_pixels(cell_width_px, cell_height_px);
+                app.host_draw
+                    .store(client.graphics_usable(), Ordering::Release);
             }
-            false
+            client.graphics_usable()
+        }
+        AppEvent::ClientHostGraphics { id, supported } => {
+            let Some(client) = clients.get_mut(&id) else {
+                return false;
+            };
+            client.graphics_supported = supported;
+            if *foreground == Some(id) {
+                app.host_draw.store(
+                    client.graphics_usable(),
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+            supported && client.cell_width_px > 0 && client.cell_height_px > 0
         }
         AppEvent::ClientClipboardSucceeded { id, receipt } => {
             if *foreground != Some(id) {
@@ -1111,6 +1134,8 @@ fn apply(
                 client.cell_height_px = cell_height_px;
                 if *foreground == Some(id) {
                     app.set_client_cell_pixels(cell_width_px, cell_height_px);
+                    app.host_draw
+                        .store(client.graphics_usable(), Ordering::Release);
                 }
                 // Resize/focus repair is local to this terminal. Its next frame
                 // must be complete, but other clients keep their diff baselines.
@@ -1290,6 +1315,16 @@ fn has_render_clients(clients: &Clients) -> bool {
         .any(|client| client.interest != SurfaceInterest::Suspended)
 }
 
+/// Re-arm at loop entry, before choosing an idle wait. Frame cadence still
+/// bounds retries while the one-frame queue is full.
+fn schedule_client_frame_debt(clients: &Clients, request: &mut RenderRequest) {
+    if clients.values().any(|client| {
+        client.interest != SurfaceInterest::Suspended && (client.graphics_pending || client.behind)
+    }) {
+        request.record(RenderCause::ClientResync);
+    }
+}
+
 fn latest_client(clients: &Clients) -> Option<u64> {
     clients
         .iter()
@@ -1302,8 +1337,14 @@ fn latest_client(clients: &Clients) -> Option<u64> {
 /// split geometry; the palette only matters for the `terminal` theme.
 fn apply_foreground_client(app: &mut App, clients: &Clients, foreground: Option<u64>) {
     let Some(client) = foreground.and_then(|id| clients.get(&id)) else {
+        app.host_draw
+            .store(false, std::sync::atomic::Ordering::Release);
         return;
     };
+    app.host_draw.store(
+        client.graphics_usable(),
+        std::sync::atomic::Ordering::Release,
+    );
     app.set_client_cell_pixels(client.cell_width_px, client.cell_height_px);
     if app.config.theme != "terminal" {
         return;
@@ -1931,6 +1972,31 @@ fn render_client(
             previous.width != client.render_buf.area.width
                 || previous.height != client.render_buf.area.height
         });
+    // A hyperlink change replaces the diff with a full frame, which clears the
+    // host screen. Graphics have to be uploaded again, not merely placed.
+    let upgrade_full = !full
+        && client.last_frame.as_ref().is_some_and(|previous| {
+            let current_hyperlinks =
+                protocol::frame_hyperlinks(previous, &client.retained_hyperlinks);
+            if previous.hyperlinks != current_hyperlinks {
+                return true;
+            }
+            if current_hyperlinks.is_empty() {
+                return false;
+            }
+            // `diff_buffer` writes the baseline, so probe a copy.
+            let mut probe = previous.clone();
+            let runs = protocol::diff_buffer(&mut probe, &client.render_buf);
+            protocol::diff_intersects_hyperlinks(&runs, &current_hyperlinks)
+        });
+    if client.graphics_supported && !client.graphics_usable() && (full || upgrade_full) {
+        client.graphics.request_replay();
+    }
+    let StagedGraphics {
+        bytes: graphics,
+        cache: staged_cache,
+        remainder,
+    } = stage_kitty_frame(app, client, full || upgrade_full);
     let message = if full {
         let mut frame = protocol::frame_from_buffer(
             &client.render_buf,
@@ -1939,10 +2005,12 @@ fn render_client(
             protocol::HostCursorStyle::from_appearance(cursor_style),
         );
         frame.hyperlinks = protocol::frame_hyperlinks(&frame, &client.retained_hyperlinks);
-        client.last_frame = Some(frame);
-        Some(ServerMessage::Frame(
-            client.last_frame.as_ref().expect("frame stored").clone(),
-        ))
+        frame.graphics = graphics;
+        client.last_frame = Some(frame.clone());
+        if let Some(stored) = client.last_frame.as_mut() {
+            stored.graphics.clear();
+        }
+        Some(ServerMessage::Frame(frame))
     } else {
         let previous = client.last_frame.as_mut().expect("frame baseline exists");
         let cursor_style = protocol::HostCursorStyle::from_appearance(cursor_style);
@@ -1958,8 +2026,10 @@ fn render_client(
         previous.cursor_visible = cursor_visible;
         previous.cursor_style = cursor_style;
         if hyperlinks_changed || linked_cells_changed {
-            Some(ServerMessage::Frame(previous.clone()))
-        } else if runs.is_empty() && !cursor_moved {
+            let mut frame = previous.clone();
+            frame.graphics = graphics;
+            Some(ServerMessage::Frame(frame))
+        } else if runs.is_empty() && !cursor_moved && graphics.is_empty() {
             None
         } else {
             Some(ServerMessage::FrameDiff(protocol::FrameDiff {
@@ -1969,6 +2039,7 @@ fn render_client(
                 cursor,
                 cursor_visible,
                 cursor_style,
+                graphics,
             }))
         }
     };
@@ -1990,6 +2061,8 @@ fn render_client(
             client.prepare_ticket = None;
             client.behind = false;
             client.force_full = false;
+            client.graphics = staged_cache;
+            client.graphics_pending = remainder;
             RenderClientOutcome {
                 enqueued: true,
                 disconnected: false,
@@ -1998,6 +2071,7 @@ fn render_client(
         Err(FrameSendError::Full) => {
             FRAMES_BACKPRESSURED.fetch_add(1, Ordering::Relaxed);
             client.behind = true;
+            client.graphics_pending = false;
             client.retained_ready = false;
             RenderClientOutcome::default()
         }
@@ -2012,6 +2086,86 @@ fn render_client(
 struct RenderClientOutcome {
     enqueued: bool,
     disconnected: bool,
+}
+
+struct StagedGraphics {
+    bytes: Vec<u8>,
+    cache: crate::terminal::kitty_graphics::HostGraphicsCache,
+    remainder: bool,
+}
+
+fn stage_kitty_frame(app: &App, client: &ClientState, replay: bool) -> StagedGraphics {
+    let mut cache = client.graphics.clone();
+    if !client.graphics_usable() {
+        if client.graphics_supported && replay {
+            cache.request_replay();
+        }
+        return StagedGraphics {
+            bytes: Vec::new(),
+            cache,
+            remainder: false,
+        };
+    }
+    if replay {
+        cache.request_replay();
+    }
+    let show = ui::retained_pty_eligible(app);
+    let mut live = HashSet::new();
+    let mut inspected = HashSet::new();
+    let mut placements = Vec::new();
+    let mut retained = HashMap::new();
+    for (id, pane) in &app.panes {
+        live.insert(id.0);
+        let Ok(engine) = pane.engine.lock() else {
+            continue;
+        };
+        inspected.insert(id.0);
+        for (image_id, fingerprint) in engine.retained_kitty_images() {
+            retained.insert(
+                crate::terminal::kitty_graphics::SourceKey {
+                    pane_id: id.0,
+                    image_id,
+                },
+                fingerprint,
+            );
+        }
+        if !show || !engine.has_kitty_graphics() {
+            continue;
+        }
+        let Some(area) = client
+            .retained_pane_content
+            .iter()
+            .find_map(|(pane_id, rect)| (*pane_id == *id).then_some(*rect))
+        else {
+            continue;
+        };
+        for visible in engine.kitty_visible_placements(client.cell_width_px, client.cell_height_px)
+        {
+            placements.push(crate::terminal::kitty_graphics::ScreenPlacement {
+                pane_id: id.0,
+                area_x: area.x,
+                area_y: area.y,
+                area_width: area.width,
+                area_height: area.height,
+                cell_width_px: u32::from(client.cell_width_px),
+                cell_height_px: u32::from(client.cell_height_px),
+                visible,
+            });
+        }
+    }
+    let bytes = crate::terminal::kitty_graphics::encode_host_frame(
+        &mut cache,
+        &placements,
+        &live,
+        &inspected,
+        &retained,
+    );
+    let remainder = cache.remainder();
+    StagedGraphics {
+        bytes,
+        cache,
+        remainder,
+    }
 }
 
 fn bind_client_listener(
@@ -2282,6 +2436,14 @@ pub(super) fn handle_client(
                         cell_width_px,
                         cell_height_px,
                     })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::HostGraphics { supported }) => {
+                if app_tx
+                    .send(AppEvent::ClientHostGraphics { id, supported })
                     .is_err()
                 {
                     break;
@@ -2882,6 +3044,93 @@ mod tests {
             ServerMessage::FrameDiff(frame) => (frame.width, frame.height),
             _ => panic!("expected rendered frame"),
         }
+    }
+
+    #[test]
+    fn graphics_and_backpressure_debt_schedule_a_cadenced_idle_wake() {
+        let (client, _rx) = display_client(80, 24, 1);
+        let mut clients = HashMap::from([(7, client)]);
+        for behind in [false, true] {
+            let client = clients.get_mut(&7).unwrap();
+            client.graphics_pending = !behind;
+            client.behind = behind;
+            let mut request = super::RenderRequest::default();
+            super::schedule_client_frame_debt(&clients, &mut request);
+            assert!(request.needs_render());
+            assert!(super::frame_wait(Duration::ZERO) >= super::FRAME_INTERVAL);
+            assert!(!super::frame_cadence_ready(Duration::ZERO));
+            // Clearing a render must not let the next loop entry sleep forever.
+            request.clear();
+            super::schedule_client_frame_debt(&clients, &mut request);
+            assert!(request.needs_render());
+            clients.get_mut(&7).unwrap().interest = SurfaceInterest::Suspended;
+            request.clear();
+            super::schedule_client_frame_debt(&clients, &mut request);
+            assert!(!request.needs_render());
+            clients.get_mut(&7).unwrap().interest = SurfaceInterest::Active;
+        }
+    }
+
+    #[test]
+    fn kitty_missing_geometry_fails_closed_even_after_host_agrees() {
+        let _env = crate::persist::test_env("kitty-no-geometry");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (client, _frames) = display_client(80, 24, 1);
+        let mut clients = HashMap::from([(7, client)]);
+        let mut foreground = Some(7);
+        let mut size = (80, 24);
+        let mut activity = 2;
+        apply(
+            AppEvent::ClientHostGraphics {
+                id: 7,
+                supported: true,
+            },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut activity,
+        );
+        assert!(!app.host_draw.load(Ordering::Acquire));
+        let query = b"\x1b_Ga=q,i=9;AAAA\x1b\\";
+        let (reply_tx, replies) = mpsc::channel();
+        let mut engine =
+            crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 5, reply_tx, 64 * 1024);
+        use crate::terminal::vt::VtEngine;
+        engine.advance(query);
+        let crate::terminal::pty::InputAction::Bytes(bytes) = replies.try_recv().unwrap() else {
+            panic!("query reply")
+        };
+        assert!(String::from_utf8_lossy(&bytes).contains("ENOTSUPPORTED"));
+        assert!(super::stage_kitty_frame(&app, &clients[&7], true)
+            .bytes
+            .is_empty());
+        // A passive display's usable geometry must not enable this foreground.
+        let (mut passive, _rx) = display_client(80, 24, 0);
+        passive.graphics_supported = true;
+        passive.cell_width_px = 5;
+        passive.cell_height_px = 5;
+        clients.insert(8, passive);
+        assert!(!app.host_draw.load(Ordering::Acquire));
+        apply(
+            AppEvent::ClientCellPixels {
+                id: 7,
+                cell_width_px: 10,
+                cell_height_px: 20,
+            },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut activity,
+        );
+        assert!(app.host_draw.load(Ordering::Acquire));
+        engine.advance(query);
+        let crate::terminal::pty::InputAction::Bytes(bytes) = replies.try_recv().unwrap() else {
+            panic!("query reply")
+        };
+        assert!(String::from_utf8_lossy(&bytes).contains("OK"));
     }
 
     #[test]
@@ -3840,6 +4089,7 @@ mod tests {
                 cursor: None,
                 cursor_visible: false,
                 cursor_style: crate::ipc::protocol::HostCursorStyle::default(),
+                graphics: Vec::new(),
             })
         };
 
@@ -3917,6 +4167,7 @@ mod tests {
                 cursor: None,
                 cursor_visible: false,
                 cursor_style: crate::ipc::protocol::HostCursorStyle::default(),
+                graphics: Vec::new(),
             }))
             .is_ok());
         assert!(client.send_control(ServerMessage::Detach).is_ok());
