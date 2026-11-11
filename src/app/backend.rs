@@ -800,6 +800,7 @@ impl App {
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget = self.config.scrollback_bytes();
         let appearance = self.pane_appearance;
+        let host_graphics = self.host_graphics.clone();
         let app_tx = self.app_tx.clone();
         let event_tx = self.app_tx.clone();
         let pending_deletes = self
@@ -852,6 +853,7 @@ impl App {
                                 &[],
                                 history_budget,
                                 appearance,
+                                host_graphics.clone(),
                             ),
                             None => crate::terminal::pty::Pane::spawn(
                                 pane_id,
@@ -863,6 +865,7 @@ impl App {
                                 &shell,
                                 history_budget,
                                 appearance,
+                                host_graphics.clone(),
                             ),
                         }
                         .map_err(|_| "PTY or root process failed to start".to_string())
@@ -2014,6 +2017,7 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
+            app.host_graphics.clone(),
         );
         app.panes.get_mut(&pane).unwrap().engine = engine.clone();
         app.config.layout.agent_title = false;
@@ -2057,6 +2061,7 @@ mod tests {
             tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes.get_mut(&pane).unwrap().engine = engine.clone();
         let floor = crate::ipc::api::current_sequence(&app.events);
@@ -2220,6 +2225,7 @@ mod tests {
             &valid_shell,
             app.config.scrollback_bytes(),
             app.pane_appearance,
+            app.host_graphics.clone(),
         )
         .unwrap();
         app.panes.insert(deferred, ready);
