@@ -17,10 +17,13 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STORED_IMAGES: usize = 32;
 const MAX_PLACEMENTS: usize = 128;
 const KITTY_CHUNK_BYTES: usize = 3072;
-const HOST_IMAGE_ID_BASE: u32 = 10_000;
-const HOST_IMAGE_ID_LAST: u32 = HOST_IMAGE_ID_BASE + 899_999;
-/// Child `c`/`r` above this is rejected instead of allocating cursor movement.
+pub(crate) const HOST_IMAGE_ID_BASE: u32 = 10_000;
+pub(crate) const HOST_IMAGE_ID_LAST: u32 = HOST_IMAGE_ID_BASE + 899_999;
+/// Explicit cell spans and natural image dimensions share this ceiling, so
+/// even 1px cells cannot produce an unbounded cursor move or anchor lookback.
 const MAX_PLACEMENT_CELLS: u32 = 4_096;
+/// Bound the decoded surface as well as compressed/transmitted storage.
+const MAX_DECODED_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Graphics bytes in one frame stay far under the 64 MiB client frame cap.
 pub(crate) const GRAPHICS_FRAME_BUDGET: usize = 16 * 1024 * 1024;
 /// Grid reflow uses this range for anchors that do not exist yet.
@@ -94,266 +97,10 @@ pub(crate) fn host_cell_symbol(symbol: &str) -> &str {
     }
 }
 
-/// Child output with Kitty APC sequences removed is returned separately.
-/// Placeholder characters in the plain text are rewritten before the VT parser.
-#[derive(Debug, Default)]
-pub(crate) struct GraphicsParser {
-    state: ParseState,
-    pending: Vec<u8>,
-    /// Incomplete UTF-8, held so a placeholder split from its combining marks
-    /// is still rewritten as one space.
-    plain_carry: Vec<u8>,
-    /// The previous chunk replaced U+10EEEE. Leading marks belong to that
-    /// placeholder, not to the space that replaced it.
-    swallow_marks: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ParseState {
-    #[default]
-    Ground,
-    Esc,
-    Apc,
-    Kitty,
-    KittyEsc,
-    Overflow,
-    OverflowEsc,
-}
-
-#[derive(Debug)]
-pub(crate) struct ParsedCommand {
-    entries: Vec<(char, String)>,
-    payload: Vec<u8>,
-}
-
-impl ParsedCommand {
-    /// Account decoded payload, metadata allocations and even empty commands.
-    pub(crate) fn is_query(&self) -> bool {
-        Keys::from_entries(&self.entries).action == 'q'
-    }
-
-    pub(crate) fn held_bytes(&self) -> usize {
-        self.payload
-            .capacity()
-            .saturating_add(
-                self.entries
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(char, String)>()),
-            )
-            .saturating_add(
-                self.entries
-                    .iter()
-                    .map(|(_, value)| value.capacity())
-                    .sum::<usize>(),
-            )
-            .saturating_add(std::mem::size_of::<Self>())
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum StreamEvent {
-    Plain(Vec<u8>),
-    Command(ParsedCommand),
-}
-
-impl GraphicsParser {
-    pub(crate) fn is_idle(&self) -> bool {
-        self.state == ParseState::Ground && self.pending.is_empty()
-    }
-
-    pub(crate) fn drain(&mut self, input: &[u8]) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
-        let mut plain = std::mem::take(&mut self.plain_carry);
-        let mut swallow_marks = self.swallow_marks;
-        let mut index = 0;
-        while index < input.len() {
-            match self.state {
-                ParseState::Ground => {
-                    if input[index] == 0x1b {
-                        self.state = ParseState::Esc;
-                        index += 1;
-                    } else {
-                        let end = input[index..]
-                            .iter()
-                            .position(|byte| *byte == 0x1b)
-                            .map_or(input.len(), |offset| index + offset);
-                        plain.extend_from_slice(&input[index..end]);
-                        index = end;
-                    }
-                }
-                ParseState::Esc => {
-                    if input[index] == b'_' {
-                        self.state = ParseState::Apc;
-                        index += 1;
-                    } else {
-                        plain.push(0x1b);
-                        self.state = ParseState::Ground;
-                    }
-                }
-                ParseState::Apc => {
-                    if input[index] == b'G' {
-                        self.pending.clear();
-                        self.state = ParseState::Kitty;
-                        index += 1;
-                    } else {
-                        plain.extend_from_slice(b"\x1b_");
-                        self.state = ParseState::Ground;
-                    }
-                }
-                ParseState::Kitty => {
-                    if input[index] == 0x1b {
-                        self.state = ParseState::KittyEsc;
-                        index += 1;
-                    } else if self.pending.len() >= MAX_APC_BYTES {
-                        self.pending.clear();
-                        self.state = ParseState::Overflow;
-                        index += 1;
-                    } else {
-                        self.pending.push(input[index]);
-                        index += 1;
-                    }
-                }
-                ParseState::KittyEsc => {
-                    if input[index] == b'\\' {
-                        flush_plain(&mut plain, &mut events, &mut swallow_marks);
-                        if let Some(command) = parse_command(&self.pending) {
-                            events.push(StreamEvent::Command(command));
-                        }
-                        self.pending.clear();
-                        self.state = ParseState::Ground;
-                        index += 1;
-                    } else {
-                        if self.pending.len() < MAX_APC_BYTES {
-                            self.pending.push(0x1b);
-                        }
-                        self.state = ParseState::Kitty;
-                    }
-                }
-                ParseState::Overflow => {
-                    if input[index] == 0x1b {
-                        self.state = ParseState::OverflowEsc;
-                    }
-                    index += 1;
-                }
-                ParseState::OverflowEsc => {
-                    self.state = if input[index] == b'\\' {
-                        ParseState::Ground
-                    } else {
-                        ParseState::Overflow
-                    };
-                    index += 1;
-                }
-            }
-        }
-        if self.state == ParseState::Ground {
-            let hold = trailing_incomplete_utf8(&plain);
-            if hold > 0 {
-                self.plain_carry = plain.split_off(plain.len() - hold);
-            }
-        }
-        flush_plain(&mut plain, &mut events, &mut swallow_marks);
-        self.swallow_marks = swallow_marks;
-        events
-    }
-}
-
-fn flush_plain(plain: &mut Vec<u8>, events: &mut Vec<StreamEvent>, swallow: &mut bool) {
-    if plain.is_empty() {
-        return;
-    }
-    let mut sanitized = Vec::with_capacity(plain.len());
-    emit_plain(plain, &mut sanitized, swallow);
-    plain.clear();
-    if !sanitized.is_empty() {
-        events.push(StreamEvent::Plain(sanitized));
-    }
-}
-
-fn trailing_incomplete_utf8(input: &[u8]) -> usize {
-    match std::str::from_utf8(input) {
-        Err(err) if err.error_len().is_none() => input.len() - err.valid_up_to(),
-        _ => 0,
-    }
-}
-
-fn emit_plain(input: &[u8], out: &mut Vec<u8>, swallow: &mut bool) {
-    if !input.contains(&0xF4) && !*swallow {
-        out.extend_from_slice(input);
-        return;
-    }
-    let mut index = 0;
-    while index < input.len() {
-        if input[index..].starts_with(PLACEHOLDER) {
-            out.push(b' ');
-            *swallow = true;
-            index += PLACEHOLDER.len();
-            index = skip_zero_width(input, index);
-            continue;
-        }
-        if *swallow {
-            let next = skip_zero_width(input, index);
-            if next != index {
-                index = next;
-                continue;
-            }
-            *swallow = false;
-        }
-        out.push(input[index]);
-        index += 1;
-    }
-}
-
-fn skip_zero_width(input: &[u8], mut index: usize) -> usize {
-    while index < input.len() {
-        let rest = &input[index..];
-        let (valid, stop) = match std::str::from_utf8(rest) {
-            Ok(text) => (text, true),
-            Err(err) if err.valid_up_to() > 0 => {
-                let text = std::str::from_utf8(&rest[..err.valid_up_to()]).unwrap_or("");
-                (text, err.error_len().is_some())
-            }
-            Err(_) => return index,
-        };
-        let mut consumed = 0;
-        for ch in valid.chars() {
-            if unicode_width::UnicodeWidthChar::width(ch) != Some(0) {
-                return index;
-            }
-            consumed += ch.len_utf8();
-            index += ch.len_utf8();
-        }
-        if stop || consumed == 0 {
-            break;
-        }
-    }
-    index
-}
-
-fn parse_command(raw: &[u8]) -> Option<ParsedCommand> {
-    let split = raw
-        .iter()
-        .position(|byte| *byte == b';')
-        .unwrap_or(raw.len());
-    let mut entries = Vec::new();
-    if split > 0 {
-        for part in raw[..split].split(|byte| *byte == b',') {
-            let Some(eq) = part.iter().position(|byte| *byte == b'=') else {
-                continue;
-            };
-            if eq != 1 || !part[0].is_ascii_alphabetic() {
-                continue;
-            }
-            let value = String::from_utf8_lossy(&part[eq + 1..]).into_owned();
-            entries.push((part[0] as char, value));
-        }
-    }
-    let payload = if split < raw.len() {
-        base64_decode(&raw[split + 1..])?
-    } else {
-        Vec::new()
-    };
-    Some(ParsedCommand { entries, payload })
-}
+mod parser;
+#[cfg(test)]
+use parser::emit_plain;
+pub(crate) use parser::{GraphicsParser, ParsedCommand, StreamEvent};
 
 #[derive(Debug, Clone)]
 struct Keys {
@@ -441,6 +188,10 @@ impl Keys {
             }
         }
         keys
+    }
+
+    fn supported_transfer(&self) -> bool {
+        self.medium == 'd' && self.compression == '\0' && matches!(self.format, 24 | 32 | 100)
     }
 
     fn continuation(entries: &[(char, String)]) -> bool {
@@ -580,10 +331,6 @@ impl Default for PaneGraphics {
 }
 
 impl PaneGraphics {
-    pub(crate) fn parser_idle(&self) -> bool {
-        self.parser.is_idle()
-    }
-
     pub(crate) fn has_placements(&self) -> bool {
         !self.placements.is_empty()
     }
@@ -593,7 +340,7 @@ impl PaneGraphics {
     }
 
     pub(crate) fn parser_holds_text(&self) -> bool {
-        !self.parser_idle() || self.parser.swallow_marks || !self.parser.plain_carry.is_empty()
+        self.parser.holds_text()
     }
 
     pub(crate) fn retained_images(&self) -> Vec<(u32, u64)> {
@@ -604,11 +351,13 @@ impl PaneGraphics {
     }
 
     pub(crate) fn lookback_rows(&self, cell_height_px: u32) -> i32 {
-        self.placements
+        let rows = self
+            .placements
             .iter()
             .map(|placement| self.placement_rows(placement, cell_height_px))
             .max()
-            .unwrap_or(0) as i32
+            .unwrap_or(0);
+        i32::try_from(rows).unwrap_or(i32::MAX)
     }
 
     pub(crate) fn cursor_span(
@@ -623,18 +372,8 @@ impl PaneGraphics {
         let image = self.images.get(&placement.image_id)?;
         let width = source_extent(image.width, placement.source_x, placement.source_width);
         let height = source_extent(image.height, placement.source_y, placement.source_height);
-        let cols = if placement.columns != 0 {
-            placement.columns
-        } else {
-            width.div_ceil(cell_width_px).max(1)
-        }
-        .min(MAX_PLACEMENT_CELLS);
-        let rows = if placement.rows != 0 {
-            placement.rows
-        } else {
-            height.div_ceil(cell_height_px).max(1)
-        }
-        .min(MAX_PLACEMENT_CELLS);
+        let cols = placement_axis_span(placement.columns, width, cell_width_px);
+        let rows = placement_axis_span(placement.rows, height, cell_height_px);
         Some((cols, rows))
     }
 
@@ -795,19 +534,10 @@ impl PaneGraphics {
     }
 
     fn placement_rows(&self, placement: &Placement, cell_height_px: u32) -> u32 {
-        if placement.rows > 0 {
-            return placement.rows;
-        }
         let Some(image) = self.images.get(&placement.image_id) else {
             return 1;
         };
-        if cell_height_px == 0 {
-            1
-        } else {
-            source_extent(image.height, placement.source_y, placement.source_height)
-                .div_ceil(cell_height_px)
-                .max(1)
-        }
+        grid_span(placement, image, 0, cell_height_px).1
     }
 
     fn allocate_local_placement(&mut self, explicit: u32) -> u32 {
@@ -975,6 +705,9 @@ impl PaneGraphics {
         self.pending = None;
         let keys = Keys::from_entries(&command.entries);
         if keys.more && keys.medium == 'd' && keys.action != 'q' && keys.action != 'd' {
+            if command.payload.len() > self.image_limit() {
+                return error_action(&keys, "EBADF").into_iter().collect();
+            }
             self.pending = Some(PendingTransfer {
                 keys,
                 data: command.payload,
@@ -1011,8 +744,11 @@ impl PaneGraphics {
             return Vec::new();
         };
         if pending.data.len().saturating_add(command.payload.len()) > limit {
-            self.pending = None;
-            return vec![GraphicsAction::Reply(error_reply(None, "EBADF"))];
+            let keys = self.pending.take().map(|pending| pending.keys);
+            return keys
+                .and_then(|keys| error_action(&keys, "EBADF"))
+                .into_iter()
+                .collect();
         }
         pending.data.extend_from_slice(&command.payload);
         if more {
@@ -1044,7 +780,7 @@ impl PaneGraphics {
             self.delete(&keys);
             return quiet_ok(&keys).into_iter().collect();
         }
-        if keys.medium != 'd' || keys.compression == 'z' {
+        if !keys.supported_transfer() {
             return error_action(&keys, "EINVAL").into_iter().collect();
         }
         // Animation frames have separate compositing/selection semantics. Until
@@ -1095,8 +831,13 @@ impl PaneGraphics {
         actions
     }
 
+    /// Report pane capabilities, not host-only media/codec support. Queries
+    /// never store pixels and honor q=1 success/q=2 all-response suppression.
     fn query_reply(&self, keys: &Keys) -> GraphicsAction {
-        if !self.queries_enabled {
+        if !self.queries_enabled || !keys.supported_transfer() {
+            if keys.quiet >= 2 {
+                return GraphicsAction::None;
+            }
             let id = keys
                 .image_id
                 .map(|id| format!("i={id}"))
@@ -1106,6 +847,9 @@ impl PaneGraphics {
         let Some(id) = keys.image_id else {
             return GraphicsAction::None;
         };
+        if keys.quiet != 0 {
+            return GraphicsAction::None;
+        }
         let mut body = format!("i={id}");
         if keys.feature == Some('T') {
             body.push_str(",e=T");
@@ -1164,11 +908,13 @@ impl PaneGraphics {
             }
             100 => match png_size(&data) {
                 Some(size) => size,
-                None if keys.width > 0 && keys.height > 0 => (keys.width, keys.height),
                 None => return false,
             },
             _ => return false,
         };
+        if !bounded_image_size(width, height) {
+            return false;
+        }
         let fingerprint = fingerprint(&data);
         if self
             .images
@@ -1229,25 +975,30 @@ fn grid_span(
     cell_width_px: u32,
     cell_height_px: u32,
 ) -> (u32, u32) {
-    let cols = if placement.columns > 0 {
-        placement.columns
-    } else if cell_width_px > 0 {
-        source_extent(image.width, placement.source_x, placement.source_width)
-            .div_ceil(cell_width_px)
-            .max(1)
+    (
+        placement_axis_span(
+            placement.columns,
+            source_extent(image.width, placement.source_x, placement.source_width),
+            cell_width_px,
+        ),
+        placement_axis_span(
+            placement.rows,
+            source_extent(image.height, placement.source_y, placement.source_height),
+            cell_height_px,
+        ),
+    )
+}
+
+/// One span calculation for rendering, cursor movement and anchor lookback.
+/// Accepted images and explicit spans are bounded before reaching this helper.
+fn placement_axis_span(explicit: u32, source: u32, cell_pixels: u32) -> u32 {
+    if explicit > 0 {
+        explicit
+    } else if cell_pixels > 0 {
+        source.div_ceil(cell_pixels).max(1)
     } else {
         1
-    };
-    let rows = if placement.rows > 0 {
-        placement.rows
-    } else if cell_height_px > 0 {
-        source_extent(image.height, placement.source_y, placement.source_height)
-            .div_ceil(cell_height_px)
-            .max(1)
-    } else {
-        1
-    };
-    (cols, rows)
+    }
 }
 
 /// Resolve a crop against the remaining pixels, including omitted w/h.
@@ -1306,13 +1057,15 @@ fn error_reply(image_id: Option<u32>, code: &str) -> Vec<u8> {
     }
 }
 
-fn png_size(data: &[u8]) -> Option<(u32, u32)> {
-    if data.len() < 24 || &data[..8] != b"\x89PNG\r\n\x1a\n" || &data[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(data[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(data[20..24].try_into().ok()?);
-    (width > 0 && height > 0).then_some((width, height))
+mod png;
+use png::png_size;
+
+fn bounded_image_size(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_PLACEMENT_CELLS
+        && height <= MAX_PLACEMENT_CELLS
+        && rgb_byte_len(width, height, 4).is_some_and(|bytes| bytes <= MAX_DECODED_IMAGE_BYTES)
 }
 
 fn fingerprint(data: &[u8]) -> u64 {
@@ -1338,6 +1091,9 @@ pub(crate) fn anchor_scan_range(
 pub(crate) fn viewport_line(grid_line: i32, display_offset: i32) -> i32 {
     grid_line.saturating_add(display_offset)
 }
+
+mod occlusion;
+pub(crate) use occlusion::Occlusion;
 
 // ── host placement encoding ────────────────────────────────────────────────
 
@@ -1403,6 +1159,7 @@ struct HostPlacementKey {
     pane_id: u32,
     image_id: u32,
     placement_id: u32,
+    piece: Option<ratatui::layout::Rect>,
 }
 
 /// What this client has already uploaded to its host terminal.
@@ -1436,6 +1193,24 @@ impl HostGraphicsCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn placement_rects(&self) -> Vec<(u32, ratatui::layout::Rect)> {
+        self.host_placements
+            .iter()
+            .filter_map(|(key, id)| {
+                let host = self.sources.get(&SourceKey {
+                    pane_id: key.pane_id,
+                    image_id: key.image_id,
+                })?;
+                let p = self.placements.get(&(*host, *id))?;
+                Some((
+                    key.pane_id,
+                    ratatui::layout::Rect::new(p.x, p.y, p.cols as u16, p.rows as u16),
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn host_id(&self, pane_id: u32, image_id: u32) -> Option<u32> {
         self.sources.get(&SourceKey { pane_id, image_id }).copied()
     }
@@ -1448,12 +1223,31 @@ impl HostGraphicsCache {
 /// pixels again because the host screen was cleared. When several images do
 /// not fit in one frame, `remainder` stays set and the unsent images are left
 /// unmarked so the next frame continues.
+#[cfg(test)]
 pub(crate) fn encode_host_frame(
     cache: &mut HostGraphicsCache,
     placements: &[ScreenPlacement],
     live_panes: &HashSet<u32>,
     inspected: &HashSet<u32>,
     retained: &HashMap<SourceKey, u64>,
+) -> Vec<u8> {
+    encode_occluded_host_frame(
+        cache,
+        placements,
+        live_panes,
+        inspected,
+        retained,
+        &Occlusion::default(),
+    )
+}
+
+pub(crate) fn encode_occluded_host_frame(
+    cache: &mut HostGraphicsCache,
+    placements: &[ScreenPlacement],
+    live_panes: &HashSet<u32>,
+    inspected: &HashSet<u32>,
+    retained: &HashMap<SourceKey, u64>,
+    occlusion: &Occlusion,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     cache.remainder = false;
@@ -1487,14 +1281,10 @@ pub(crate) fn encode_host_frame(
         forget_source(cache, &mut out, source, host_id);
     }
 
-    let desired_placements = placements
+    let pieces = occlusion::frame_pieces(placements, occlusion);
+    let desired_placements = pieces
         .iter()
-        .filter(|p| clip_placement(p).is_some())
-        .map(|p| HostPlacementKey {
-            pane_id: p.pane_id,
-            image_id: p.visible.image_id,
-            placement_id: p.visible.placement_id,
-        })
+        .map(|(key, _, _)| *key)
         .collect::<HashSet<_>>();
     // Delete before reusing an id. Otherwise a stale delete can erase the new
     // placement allocated the same id in this frame.
@@ -1520,10 +1310,7 @@ pub(crate) fn encode_host_frame(
         cache.host_placements.remove(&key);
     }
     let mut planned = Vec::new();
-    for placement in placements {
-        let Some((clipped, _)) = clip_placement(placement) else {
-            continue;
-        };
+    for (key, clipped, placement) in pieces {
         let source = SourceKey {
             pane_id: placement.pane_id,
             image_id: placement.visible.image_id,
@@ -1535,12 +1322,7 @@ pub(crate) fn encode_host_frame(
             fingerprint: placement.visible.fingerprint,
         };
         let host_id = host_image_id_for(cache, &mut out, source, signature);
-        let Some(placement_id) = host_placement_id_for(
-            cache,
-            placement.pane_id,
-            placement.visible.image_id,
-            placement.visible.placement_id,
-        ) else {
+        let Some(placement_id) = host_placement_id_for(cache, key) else {
             // Exhaustion is bounded; never spin on the server event loop.
             continue;
         };
@@ -1562,8 +1344,37 @@ pub(crate) fn encode_host_frame(
         cache.placements.remove(&(host_id, placement_id));
     }
 
+    // Remove changed geometry before the upload budget can stop delivery. An
+    // old fragment must never remain over a newly moved menu on a partial frame.
+    for (host, id, clipped, placement, _) in &planned {
+        let desired = placement_signature(
+            *clipped,
+            placement.visible.z,
+            placement.visible.scroll_offset,
+        );
+        if cache
+            .placements
+            .get(&(*host, *id))
+            .is_some_and(|old| *old != desired)
+        {
+            encode_delete_placement(&mut out, *host, *id);
+            cache.placements.remove(&(*host, *id));
+        }
+    }
     for (host_id, placement_id, clipped, placement, signature) in planned {
         let image_current = cache.images.get(&host_id) == Some(&signature);
+        if image_current
+            && cache.placements.get(&(host_id, placement_id))
+                == Some(&placement_signature(
+                    clipped,
+                    placement.visible.z,
+                    placement.visible.scroll_offset,
+                ))
+        {
+            // Unchanged fragments spend no command budget. Otherwise a nearly
+            // full frame could repeatedly stop before its remaining pieces.
+            continue;
+        }
         let estimate = upload_estimate(&placement.visible, image_current);
         let budget = if cache.budget_override == 0 {
             GRAPHICS_FRAME_BUDGET
@@ -1667,17 +1478,7 @@ fn host_image_id_for(
     id
 }
 
-fn host_placement_id_for(
-    cache: &mut HostGraphicsCache,
-    pane_id: u32,
-    image_id: u32,
-    placement_id: u32,
-) -> Option<u32> {
-    let key = HostPlacementKey {
-        pane_id,
-        image_id,
-        placement_id,
-    };
+fn host_placement_id_for(cache: &mut HostGraphicsCache, key: HostPlacementKey) -> Option<u32> {
     if let Some(id) = cache.host_placements.get(&key).copied() {
         return Some(id);
     }
@@ -1742,6 +1543,8 @@ fn forget_source(
         .retain(|key, _| key.pane_id != source.pane_id || key.image_id != source.image_id);
 }
 
+/// Clip destination cells to the pane and map every cut through the same
+/// absolute offset-aware source edges used for overlay fragments.
 fn clip_placement(placement: &ScreenPlacement) -> Option<(Clipped, u32)> {
     if placement.area_width == 0
         || placement.area_height == 0
@@ -1794,34 +1597,20 @@ fn clip_placement(placement: &ScreenPlacement) -> Option<(Clipped, u32)> {
             visible.y_offset,
         )
     } else {
-        let src_w = source_extent(visible.image_width, visible.source_x, visible.source_width);
-        let src_h = source_extent(
-            visible.image_height,
-            visible.source_y,
-            visible.source_height,
+        let rect = ratatui::layout::Rect::new(
+            placement.area_x.saturating_add(column as u16),
+            placement.area_y.saturating_add(row as u16),
+            cols as u16,
+            rows as u16,
         );
-        let source_x = visible
-            .source_x
-            .saturating_add(scale_cells(left, src_w, visible.grid_cols));
-        let source_y = visible
-            .source_y
-            .saturating_add(scale_cells(top, src_h, visible.grid_rows));
-        let source_width = scale_cells(cols, src_w, visible.grid_cols)
-            .max(1)
-            .min(visible.image_width.saturating_sub(source_x));
-        let source_height = scale_cells(rows, src_h, visible.grid_rows)
-            .max(1)
-            .min(visible.image_height.saturating_sub(source_y));
-        if source_width == 0 || source_height == 0 {
-            return None;
-        }
+        let cropped = occlusion::crop_piece(placement, rect)?;
         (
-            source_x,
-            source_y,
-            source_width,
-            source_height,
-            if left == 0 { visible.x_offset } else { 0 },
-            if top == 0 { visible.y_offset } else { 0 },
+            cropped.source_x,
+            cropped.source_y,
+            cropped.source_width,
+            cropped.source_height,
+            cropped.x_offset,
+            cropped.y_offset,
         )
     };
     Some((
@@ -1856,14 +1645,6 @@ fn placement_signature(clipped: Clipped, z: i32, scroll_offset: u32) -> Placemen
         z,
         scroll_offset,
     }
-}
-
-fn scale_cells(part: u32, whole: u32, parts: u32) -> u32 {
-    if parts == 0 {
-        return 0;
-    }
-    ((u64::from(part).saturating_mul(u64::from(whole)) / u64::from(parts)).min(u64::from(u32::MAX)))
-        as u32
 }
 
 fn encode_upload(out: &mut Vec<u8>, visible: &VisiblePlacement, host_id: u32) {
@@ -1970,50 +1751,6 @@ fn base64_encode(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
-    fn value(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let filtered = input
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
-    if filtered.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
-    let (chunks, _) = filtered.as_chunks::<4>();
-    for chunk in chunks {
-        let pad = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
-        if pad > 2 {
-            return None;
-        }
-        let mut n = 0u32;
-        for (index, byte) in chunk.iter().enumerate() {
-            if *byte == b'=' {
-                continue;
-            }
-            n |= u32::from(value(*byte)?) << (18 - 6 * index);
-        }
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
 /// Cursor movement after a direct placement: right by columns and down by rows.
 pub(crate) fn cursor_after_image(
     column: u32,
@@ -2051,753 +1788,7 @@ pub(crate) fn delete_action(keys_action: char, delete: Option<char>) -> Option<G
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod bounds_tests;
 
-    fn rgba(width: u32, height: u32, byte: u8) -> Vec<u8> {
-        vec![byte; width as usize * height as usize * 4]
-    }
-
-    fn visible(viewport_col: i32, viewport_row: i32, scroll: u32) -> VisiblePlacement {
-        let data = rgba(30, 30, 9);
-        let fingerprint = fingerprint(&data);
-        VisiblePlacement {
-            image_id: 7,
-            placement_id: 3,
-            z: 0,
-            viewport_col,
-            viewport_row,
-            grid_cols: 3,
-            grid_rows: 3,
-            pixel_width: 0,
-            pixel_height: 0,
-            image_width: 30,
-            image_height: 30,
-            format_code: 32,
-            data: Arc::from(data.into_boxed_slice()),
-            fingerprint,
-            source_x: 0,
-            source_y: 0,
-            source_width: 0,
-            source_height: 0,
-            x_offset: 0,
-            y_offset: 0,
-            scroll_offset: scroll,
-        }
-    }
-
-    fn screen(pane: u32, placement: VisiblePlacement) -> ScreenPlacement {
-        ScreenPlacement {
-            pane_id: pane,
-            area_x: 2,
-            area_y: 1,
-            area_width: 20,
-            area_height: 10,
-            cell_width_px: 10,
-            cell_height_px: 10,
-            visible: placement,
-        }
-    }
-
-    fn text(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-
-    fn retained_of(screens: &[ScreenPlacement]) -> HashMap<SourceKey, u64> {
-        screens
-            .iter()
-            .map(|screen| {
-                (
-                    SourceKey {
-                        pane_id: screen.pane_id,
-                        image_id: screen.visible.image_id,
-                    },
-                    screen.visible.fingerprint,
-                )
-            })
-            .collect()
-    }
-
-    fn frame(
-        cache: &mut HostGraphicsCache,
-        screens: &[ScreenPlacement],
-        live: &HashSet<u32>,
-    ) -> Vec<u8> {
-        encode_host_frame(cache, screens, live, live, &retained_of(screens))
-    }
-
-    #[test]
-    fn clipped_placement_crops_negative_viewport_and_keeps_positive_cells() {
-        let (inside, _) = clip_placement(&screen(1, visible(2, 2, 0))).unwrap();
-        assert_eq!((inside.x, inside.y, inside.cols, inside.rows), (4, 3, 3, 3));
-        assert_eq!((inside.source_x, inside.source_y), (0, 0));
-
-        let (cropped, _) = clip_placement(&screen(1, visible(-1, -1, 0))).unwrap();
-        assert_eq!(
-            (cropped.x, cropped.y, cropped.cols, cropped.rows),
-            (2, 1, 2, 2)
-        );
-        assert_eq!((cropped.source_x, cropped.source_y), (10, 10));
-        assert_eq!((cropped.source_width, cropped.source_height), (20, 20));
-    }
-
-    #[test]
-    fn scroll_offset_change_replaces_placement_without_reuploading() {
-        let mut cache = HostGraphicsCache::default();
-        let live = HashSet::from([1]);
-        let first = frame(&mut cache, &[screen(1, visible(0, 0, 0))], &live);
-        let first = text(&first);
-        assert!(first.contains("a=t"), "{first}");
-        assert!(first.contains("a=p"), "{first}");
-
-        assert!(frame(&mut cache, &[screen(1, visible(0, 0, 0))], &live).is_empty());
-
-        let moved = frame(&mut cache, &[screen(1, visible(0, 4, 3))], &live);
-        let moved = text(&moved);
-        assert!(moved.contains("a=d,d=i"), "{moved}");
-        assert!(moved.contains("a=p"), "{moved}");
-        assert!(!moved.contains("a=t"), "{moved}");
-        assert!(moved.contains("\x1b[6;3H"), "{moved}");
-    }
-
-    #[test]
-    fn pane_image_ids_are_isolated_and_close_deletes_only_that_pane() {
-        let mut cache = HostGraphicsCache::default();
-        let live = HashSet::from([1, 2]);
-        let uploaded = frame(
-            &mut cache,
-            &[screen(1, visible(0, 0, 0)), screen(2, visible(1, 1, 0))],
-            &live,
-        );
-        let uploaded = text(&uploaded);
-        let id_one = cache.host_id(1, 7).unwrap();
-        let id_two = cache.host_id(2, 7).unwrap();
-        assert_ne!(id_one, id_two);
-        assert!(uploaded.contains(&format!("i={id_one}")));
-        assert!(uploaded.contains(&format!("i={id_two}")));
-
-        let closed = frame(
-            &mut cache,
-            &[screen(2, visible(1, 1, 0))],
-            &HashSet::from([2]),
-        );
-        let closed = text(&closed);
-        assert!(closed.contains(&format!("a=d,d=I,i={id_one}")), "{closed}");
-        assert!(!closed.contains(&format!("i={id_two}")), "{closed}");
-        assert!(cache.sources.contains_key(&SourceKey {
-            pane_id: 2,
-            image_id: 7
-        }));
-        assert!(!cache.sources.contains_key(&SourceKey {
-            pane_id: 1,
-            image_id: 7
-        }));
-    }
-
-    #[test]
-    fn placeholder_characters_are_ordinary_single_width_spaces() {
-        assert_eq!(host_cell_symbol("\u{10EEEE}"), " ");
-        assert_eq!(host_cell_symbol("\u{10EEEE}\u{0305}\u{030d}"), " ");
-        assert_eq!(host_cell_symbol("A"), "A");
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(host_cell_symbol("\u{10EEEE}")),
-            1
-        );
-
-        let mut plain = Vec::new();
-        let mut swallow = false;
-        emit_plain("A\u{10EEEE}\u{0305}B".as_bytes(), &mut plain, &mut swallow);
-        assert_eq!(plain, b"A B");
-        assert!(!plain.windows(4).any(|bytes| bytes == PLACEHOLDER));
-    }
-
-    #[test]
-    fn direct_placement_parses_without_leaking_the_escape_into_text() {
-        let pixels = rgba(1, 1, 7);
-        let mut payload = Vec::new();
-        base64_encode(&pixels, &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,i=4,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        plain.extend_from_slice(b"before");
-        let actions = graphics.push(&command, &mut plain);
-        plain.extend_from_slice(b"after");
-        assert_eq!(plain, b"beforeafter");
-        assert!(matches!(actions.as_slice(), [GraphicsAction::Place(_)]));
-    }
-
-    #[test]
-    fn placement_scrolls_with_its_row_and_leaves_width_one_cells() {
-        use crate::terminal::vt::VtEngine;
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 5, tx, 64 * 1024);
-        let pixels = rgba(1, 1, 7);
-        let mut payload = Vec::new();
-        base64_encode(&pixels, &mut payload);
-        let mut command = b"before \x1b_Ga=T,f=32,s=1,v=1,C=1,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\ after\n");
-        engine.advance(&command);
-        engine.finish_output_batch();
-
-        let placed = engine.kitty_visible_placements(10, 20);
-        assert_eq!(placed.len(), 1);
-        assert_eq!(placed[0].viewport_row, 0);
-        let first = engine.screen_rows().remove(0);
-        assert!(first.starts_with("before  after"), "{first}");
-        assert!(!first.contains('\u{10EEEE}'));
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(first.trim_end()),
-            "before  after".len()
-        );
-
-        engine.advance(b"\n\n\n\n\n");
-        engine.finish_output_batch();
-        let scrolled = engine.kitty_visible_placements(10, 20);
-        assert_eq!(scrolled.len(), 1);
-        assert!(
-            scrolled[0].viewport_row < 0,
-            "{:?}",
-            scrolled[0].viewport_row
-        );
-        engine.scroll(-scrolled[0].viewport_row);
-        let restored = engine.kitty_visible_placements(10, 20);
-        assert_eq!(restored[0].viewport_row, 0);
-        for row in engine.screen_rows() {
-            assert!(!row.contains('\u{10EEEE}'));
-        }
-    }
-
-    #[test]
-    fn feature_query_does_not_advertise_unicode_placeholders() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let actions = graphics.push(b"\x1b_Ga=q,i=31,e=T,U=1,C=1\x1b\\", &mut plain);
-        match actions.as_slice() {
-            [GraphicsAction::Reply(bytes)] => {
-                let reply = text(bytes);
-                assert!(reply.contains("e=T"), "{reply}");
-                assert!(reply.contains("C=1"), "{reply}");
-                assert!(!reply.contains("U=1"), "{reply}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(plain.is_empty());
-    }
-
-    #[test]
-    fn child_query_is_refused_until_the_host_agrees() {
-        let mut graphics = PaneGraphics::default();
-        graphics.set_queries_enabled(false);
-        let mut plain = Vec::new();
-        let actions = graphics.push(b"\x1b_Ga=q,i=31,e=T,C=1\x1b\\", &mut plain);
-        match actions.as_slice() {
-            [GraphicsAction::Reply(bytes)] => {
-                let reply = text(bytes);
-                assert!(reply.contains("ENOTSUPPORTED"), "{reply}");
-                assert!(!reply.contains("OK"), "{reply}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(!cell_size_query_required(false, None));
-        assert!(!cell_size_query_required(true, Some((8, 16))));
-        assert_eq!(cell_size_query_required(true, None), !cfg!(windows));
-    }
-
-    #[test]
-    fn host_query_follows_the_display_flag() {
-        use crate::terminal::vt::VtEngine;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let flag = Arc::new(AtomicBool::new(false));
-        install_host_draw(flag.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 5, tx, 64 * 1024);
-        let query = b"\x1b_Ga=q,i=31\x1b\\";
-        engine.advance(query);
-        engine.finish_output_batch();
-        let refused = text(&input_bytes(rx.try_recv().unwrap()));
-        assert!(refused.contains("ENOTSUPPORTED"), "{refused}");
-        flag.store(true, Ordering::Release);
-        engine.advance(query);
-        engine.finish_output_batch();
-        let accepted = text(&input_bytes(rx.try_recv().unwrap()));
-        assert!(accepted.contains("OK"), "{accepted}");
-        flag.store(false, Ordering::Release);
-    }
-
-    #[test]
-    fn unsupported_animation_preserves_base_image_for_a_later_client() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 5, tx, 64 * 1024);
-        let first = rgba(1, 1, 1);
-        let second = rgba(1, 1, 2);
-        engine.advance(&transmit(b'a', b'T', 4, &first, false));
-        engine.finish_output_batch();
-        let frame_command = transmit(b'a', b'f', 4, &second, false);
-        let frame_command = String::from_utf8(frame_command)
-            .unwrap()
-            .replace("q=2", "q=0");
-        engine.advance(frame_command.as_bytes());
-        let reply = text(&input_bytes(rx.try_recv().unwrap()));
-        assert!(reply.contains("ENOTSUPPORTED"), "{reply}");
-        engine.finish_output_batch();
-        let placed = engine.kitty_visible_placements(10, 20);
-        assert_eq!(placed.len(), 1);
-        assert_eq!(&*placed[0].data, first.as_slice());
-
-        let mut cache = HostGraphicsCache::default();
-        let replay = frame(
-            &mut cache,
-            &[screen(1, placed[0].clone())],
-            &HashSet::from([1]),
-        );
-        let replay = text(&replay);
-        assert!(replay.contains("a=t"), "{replay}");
-        let mut encoded = Vec::new();
-        base64_encode(&first, &mut encoded);
-        assert!(
-            replay.contains(std::str::from_utf8(&encoded).unwrap()),
-            "{replay}"
-        );
-    }
-
-    #[test]
-    fn interrupted_or_oversized_chunks_are_not_placed() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let start = b"\x1b_Ga=T,f=32,s=1,v=1,i=9,m=1;AAAA\x1b\\";
-        assert!(graphics.push(start, &mut plain).is_empty());
-        let interrupted = graphics.push(b"\x1b_Ga=q,i=1\x1b\\", &mut plain);
-        assert!(interrupted
-            .iter()
-            .all(|action| !matches!(action, GraphicsAction::Place(_))));
-        let place = graphics.push(b"\x1b_Ga=p,i=9,c=1,r=1\x1b\\", &mut plain);
-        assert!(
-            matches!(place.as_slice(), [GraphicsAction::Reply(bytes)] if text(bytes).contains("ENOENT")),
-            "{place:?}"
-        );
-
-        graphics.set_image_limit(4);
-        assert!(graphics
-            .push(b"\x1b_Ga=T,f=32,s=1,v=1,i=8,m=1;AAAA\x1b\\", &mut plain)
-            .is_empty());
-        let overflow = graphics.push(b"\x1b_Gm=0;AAAA\x1b\\", &mut plain);
-        assert!(
-            matches!(overflow.as_slice(), [GraphicsAction::Reply(bytes)] if text(bytes).contains("EBADF")),
-            "{overflow:?}"
-        );
-        let place = graphics.push(b"\x1b_Ga=p,i=8,c=1,r=1\x1b\\", &mut plain);
-        assert!(
-            matches!(place.as_slice(), [GraphicsAction::Reply(bytes)] if text(bytes).contains("ENOENT")),
-            "{place:?}"
-        );
-    }
-
-    #[test]
-    fn unknown_cell_size_does_not_place() {
-        let mut placement = screen(1, visible(0, 0, 0));
-        placement.cell_width_px = 0;
-        placement.cell_height_px = 0;
-        let bytes = frame(
-            &mut HostGraphicsCache::default(),
-            &[placement],
-            &HashSet::from([1]),
-        );
-        assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn oversized_placement_is_rejected_without_a_huge_cursor_move() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let pixels = rgba(1, 1, 3);
-        let mut payload = Vec::new();
-        base64_encode(&pixels, &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,i=4,c=1000000,r=1000000,q=1;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        let actions = graphics.push(&command, &mut plain);
-        assert!(
-            actions
-                .iter()
-                .all(|action| !matches!(action, GraphicsAction::Place(_))),
-            "{actions:?}"
-        );
-        assert!(
-            actions.iter().any(|action| matches!(action, GraphicsAction::Reply(bytes) if text(bytes).contains("EINVAL"))),
-            "{actions:?}"
-        );
-    }
-
-    #[test]
-    fn image_dimensions_do_not_overflow() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let actions = graphics.push(
-            b"\x1b_Ga=T,f=32,s=65535,v=65535,i=4,q=1;AAAA\x1b\\",
-            &mut plain,
-        );
-        assert!(
-            actions
-                .iter()
-                .all(|action| !matches!(action, GraphicsAction::Place(_))),
-            "{actions:?}"
-        );
-    }
-
-    #[test]
-    fn quiet_defaults_to_a_reply() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let mut payload = Vec::new();
-        base64_encode(&rgba(1, 1, 4), &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,i=3,c=1,r=1;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        let actions = graphics.push(&command, &mut plain);
-        assert!(
-            actions.iter().any(|action| matches!(action, GraphicsAction::Reply(bytes) if text(bytes).contains("OK"))),
-            "{actions:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_and_automatic_placement_ids_do_not_collide() {
-        let mut graphics = PaneGraphics::default();
-        let mut plain = Vec::new();
-        let mut payload = Vec::new();
-        base64_encode(&rgba(1, 1, 5), &mut payload);
-        let mut first = b"\x1b_Ga=T,f=32,s=1,v=1,i=5,p=1,c=1,r=1,q=2;".to_vec();
-        first.extend_from_slice(&payload);
-        first.extend_from_slice(b"\x1b\\");
-        for action in graphics.push(&first, &mut plain) {
-            if let GraphicsAction::Place(placement) = action {
-                graphics.record(1, 0, placement);
-            }
-        }
-        let mut second = b"\x1b_Ga=p,i=5,c=1,r=1,q=2;".to_vec();
-        second.extend_from_slice(b"\x1b\\");
-        for action in graphics.push(&second, &mut plain) {
-            if let GraphicsAction::Place(placement) = action {
-                graphics.record(1, 0, placement);
-            }
-        }
-        let ids: Vec<_> = graphics
-            .placements
-            .iter()
-            .map(|placement| (placement.child_placement_id, placement.local_placement_id))
-            .collect();
-        assert_eq!(ids.len(), 2, "{ids:?}");
-        assert_ne!(ids[0].1, ids[1].1, "{ids:?}");
-    }
-
-    #[test]
-    fn shrunk_image_that_fits_is_not_cropped() {
-        let mut placement = visible(0, 0, 0);
-        placement.image_width = 300;
-        placement.image_height = 300;
-        placement.grid_cols = 2;
-        placement.grid_rows = 2;
-        placement.pixel_width = 300;
-        placement.pixel_height = 300;
-        placement.x_offset = 15;
-        let bytes = text(&frame(
-            &mut HostGraphicsCache::default(),
-            &[screen(1, placement)],
-            &HashSet::from([1]),
-        ));
-        assert!(!bytes.contains(",w="), "{bytes}");
-        assert!(bytes.contains(",X=15"), "{bytes}");
-    }
-
-    #[test]
-    fn dropped_frame_uploads_again_and_replay_sends_pixels() {
-        let mut cache = HostGraphicsCache::default();
-        let live = HashSet::from([1]);
-        let screens = [screen(1, visible(0, 0, 0))];
-        let mut staged = cache.clone();
-        let first = text(&frame(&mut staged, &screens, &live));
-        assert!(first.contains("a=t"), "{first}");
-        let retry = text(&frame(&mut cache, &screens, &live));
-        assert!(retry.contains("a=t"), "{retry}");
-
-        frame(&mut cache, &screens, &live);
-        cache.request_replay();
-        let again = text(&frame(&mut cache, &screens, &live));
-        assert!(again.contains("a=t"), "{again}");
-    }
-
-    #[test]
-    fn evicting_an_image_deletes_its_host_record() {
-        let mut cache = HostGraphicsCache::default();
-        let live = HashSet::from([1]);
-        frame(&mut cache, &[screen(1, visible(0, 0, 0))], &live);
-        assert!(cache.host_id(1, 7).is_some());
-        let gone = text(&encode_host_frame(
-            &mut cache,
-            &[],
-            &live,
-            &live,
-            &HashMap::new(),
-        ));
-        assert!(gone.contains("a=d,d=I"), "{gone}");
-        assert!(cache.host_id(1, 7).is_none());
-    }
-
-    #[test]
-    fn large_images_split_across_frames() {
-        let mut cache = HostGraphicsCache {
-            budget_override: 700,
-            ..HostGraphicsCache::default()
-        };
-        let mut first_image = visible(0, 0, 0);
-        first_image.data = Arc::from(vec![1u8; 120].into_boxed_slice());
-        first_image.fingerprint = fingerprint(&first_image.data);
-        let mut second_image = visible(1, 1, 0);
-        second_image.image_id = 8;
-        second_image.data = Arc::from(vec![2u8; 120].into_boxed_slice());
-        second_image.fingerprint = fingerprint(&second_image.data);
-        let screens = [screen(1, first_image), screen(1, second_image)];
-        let live = HashSet::from([1]);
-        let first = text(&frame(&mut cache, &screens, &live));
-        assert!(cache.remainder(), "{first}");
-        assert_eq!(first.matches("a=t").count(), 1, "{first}");
-        let second = text(&frame(&mut cache, &screens, &live));
-        assert!(second.contains("a=t"), "{second}");
-    }
-
-    #[test]
-    fn host_placement_ids_are_retired_and_exhaustion_is_bounded() {
-        let mut cache = HostGraphicsCache {
-            placement_id_limit: 2,
-            ..Default::default()
-        };
-        let live = HashSet::from([1]);
-        for id in 1..100 {
-            let mut image = visible(0, 0, 0);
-            image.placement_id = id;
-            frame(&mut cache, &[screen(1, image)], &live);
-            assert_eq!(cache.host_placements.len(), 1);
-        }
-        let mut images = vec![screen(1, visible(0, 0, 0)); 3];
-        for (i, p) in images.iter_mut().enumerate() {
-            p.visible.placement_id = i as u32 + 100;
-        }
-        frame(&mut cache, &images, &live);
-        assert_eq!(cache.host_placements.len(), 2);
-        assert_eq!(allocate_host_placement(&mut cache), None);
-    }
-
-    #[test]
-    fn placeholder_utf8_and_marks_split_at_every_byte() {
-        let text = "A\u{10EEEE}\u{0301}B".as_bytes();
-        for split in 1..text.len() {
-            let mut parser = GraphicsParser::default();
-            let mut plain = Vec::new();
-            for bytes in [&text[..split], &text[split..]] {
-                for event in parser.drain(bytes) {
-                    if let StreamEvent::Plain(bytes) = event {
-                        plain.extend(bytes);
-                    }
-                }
-            }
-            assert_eq!(plain, b"A B", "split {split}");
-        }
-    }
-
-    #[test]
-    fn passive_projection_does_not_change_runtime_cell_size() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 6, tx, 64 * 1024);
-        // Foreground has 10px cells, passive display has 1px cells.
-        engine.set_runtime_cell_pixels(10, 10);
-        engine.kitty_visible_placements(10, 10);
-        engine.kitty_visible_placements(1, 1);
-        let pixels = rgba(20, 10, 3);
-        let mut payload = Vec::new();
-        base64_encode(&pixels, &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=20,v=10,i=4,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        engine.advance(&command);
-        assert_eq!((engine.cursor().x, engine.cursor().y), (2, 1));
-    }
-
-    #[test]
-    fn placeholder_marks_from_the_next_read_do_not_stick() {
-        let mut parser = GraphicsParser::default();
-        let first = parser.drain("\u{10EEEE}".as_bytes());
-        let second = parser.drain("\u{0301}X".as_bytes());
-        let plain = |events: Vec<StreamEvent>| {
-            events
-                .into_iter()
-                .filter_map(|event| match event {
-                    StreamEvent::Plain(bytes) => Some(bytes),
-                    StreamEvent::Command(_) => None,
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(plain(first), b" ");
-        assert_eq!(plain(second), b"X");
-    }
-
-    #[test]
-    fn sync_update_places_at_the_cursor_the_update_moves_to() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 6, tx, 64 * 1024);
-        engine.kitty_visible_placements(10, 10);
-        let mut command = b"\x1b[?2026h\x1b[3;4H".to_vec();
-        command.extend_from_slice(&transmit(b'a', b'T', 4, &rgba(1, 1, 6), false));
-        command.extend_from_slice(b"\x1b[?2026l");
-        engine.advance(&command);
-        engine.finish_output_batch();
-        let placed = engine.kitty_visible_placements(10, 10);
-        assert_eq!(placed.len(), 1, "image missing");
-        assert_eq!((placed[0].viewport_col, placed[0].viewport_row), (3, 2));
-    }
-
-    #[test]
-    fn origin_mode_does_not_add_the_scroll_region_twice() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine =
-            crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 10, tx, 64 * 1024);
-        engine.advance(b"\x1b[3;8r\x1b[?6h");
-        let before = engine.cursor();
-        let mut payload = Vec::new();
-        base64_encode(&rgba(1, 1, 7), &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,i=4,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        engine.advance(&command);
-        let after = engine.cursor();
-        assert_eq!(
-            after.y,
-            before.y + 1,
-            "cursor row jumped by the origin twice"
-        );
-        assert_eq!(after.x, before.x.saturating_add(1));
-    }
-
-    #[test]
-    fn cursor_delete_hits_a_middle_row_of_a_tall_image() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 8, tx, 64 * 1024);
-        let mut payload = Vec::new();
-        base64_encode(&rgba(1, 1, 8), &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=3,i=4,C=1,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        engine.advance(&command);
-        engine.advance(b"\n\x1b_Ga=d,d=c,q=2;\x1b\\");
-        engine.finish_output_batch();
-        assert!(
-            engine.kitty_visible_placements(10, 10).is_empty(),
-            "cursor delete missed the image"
-        );
-    }
-
-    #[test]
-    fn tall_image_stays_visible_below_a_fixed_lookback() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine =
-            crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 5, tx, 8 * 1024 * 1024);
-        let mut payload = Vec::new();
-        base64_encode(&rgba(1, 1, 9), &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=1,v=1,c=1,r=400,i=4,C=1,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        engine.advance(&command);
-        engine.advance(&vec![b'\n'; 300]);
-        engine.finish_output_batch();
-        assert_eq!(engine.kitty_visible_placements(10, 20).len(), 1);
-    }
-
-    #[test]
-    fn reflow_keeps_the_image_with_the_wrapped_text() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(8, 6, tx, 64 * 1024);
-        engine.advance(b"01234567WRAP");
-        engine.advance(&transmit(b'a', b'T', 4, &rgba(1, 1, 2), false));
-        engine.finish_output_batch();
-        assert_eq!(engine.kitty_visible_placements(10, 10).len(), 1);
-        engine.resize(30, 6);
-        engine.finish_output_batch();
-        assert_eq!(
-            engine.kitty_visible_placements(10, 10).len(),
-            1,
-            "widen dropped the anchor"
-        );
-        engine.resize(8, 6);
-        engine.finish_output_batch();
-        assert_eq!(
-            engine.kitty_visible_placements(10, 10).len(),
-            1,
-            "narrow dropped the anchor"
-        );
-    }
-
-    #[test]
-    fn cursor_delete_resolves_omitted_columns_from_runtime_pixels() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut e = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 6, tx, 64 * 1024);
-        e.set_runtime_cell_pixels(10, 10);
-        let mut payload = Vec::new();
-        base64_encode(&rgba(30, 10, 3), &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=30,v=10,i=4,C=1,q=2;".to_vec();
-        command.extend(payload);
-        command.extend_from_slice(b"\x1b\\\x1b[2G\x1b_Ga=d,d=c,q=2;\x1b\\");
-        e.advance(&command);
-        assert!(e.kitty_visible_placements(10, 10).is_empty());
-    }
-
-    #[test]
-    fn omitted_cell_size_moves_the_cursor_from_image_pixels() {
-        use crate::terminal::vt::VtEngine;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::new(20, 6, tx, 64 * 1024);
-        engine.set_runtime_cell_pixels(10, 10);
-        let pixels = rgba(20, 10, 3);
-        let mut payload = Vec::new();
-        base64_encode(&pixels, &mut payload);
-        let mut command = b"\x1b_Ga=T,f=32,s=20,v=10,i=4,q=2;".to_vec();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        engine.advance(&command);
-        let cursor = engine.cursor();
-        assert_eq!((cursor.x, cursor.y), (2, 1));
-    }
-
-    fn transmit(key: u8, action: u8, id: u32, pixels: &[u8], more: bool) -> Vec<u8> {
-        let mut payload = Vec::new();
-        base64_encode(pixels, &mut payload);
-        let more = if more { ",m=1" } else { "" };
-        let mut command = format!(
-            "\x1b_G{}={},f=32,s=1,v=1,c=1,r=1,i={id},C=1,q=2{more};",
-            key as char, action as char
-        )
-        .into_bytes();
-        command.extend_from_slice(&payload);
-        command.extend_from_slice(b"\x1b\\");
-        command
-    }
-
-    fn input_bytes(action: crate::terminal::pty::InputAction) -> Vec<u8> {
-        match action {
-            crate::terminal::pty::InputAction::Bytes(bytes) => bytes,
-            crate::terminal::pty::InputAction::Submit { .. } => Vec::new(),
-        }
-    }
-}
+#[cfg(test)]
+mod tests;
