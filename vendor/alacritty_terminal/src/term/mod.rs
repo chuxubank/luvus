@@ -1978,6 +1978,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.colors[index] = Some(color);
+        self.event_proxy.child_color(index, Some(color));
     }
 
     /// Respond to a color query escape sequence.
@@ -2008,6 +2009,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.colors[index] = None;
+        self.event_proxy.child_color(index, None);
     }
 
     /// Forward an OSC 7501 Program Status Protocol report to the host.

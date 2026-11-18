@@ -111,6 +111,7 @@ impl ClientHarness {
         }
     }
     pub fn surface(&mut self, endpoint: Endpoint, message: ServerMessage) -> Result<()> {
+        let colors = std::sync::Arc::clone(&self.dock.host_colors);
         let exit = handle_surface_message(
             endpoint,
             message,
@@ -125,6 +126,7 @@ impl ClientHarness {
             &mut self.cursor,
             &mut self.style,
             &mut self.visible,
+            &colors,
         )?;
         assert!(exit.is_none(), "unexpected client exit");
         Ok(())

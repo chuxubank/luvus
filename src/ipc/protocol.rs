@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 24;
+/// 25 adds `TerminalColors.palette_mask` on top of the released protocol 24.
+/// `Hello` stays frozen; mismatched peers still stop at Welcome.
+pub const PROTOCOL_VERSION: u32 = 25;
 /// v0.14.1 shipped protocol 17 with `Welcome` accidentally moved to enum
 /// variant one. Its mismatch reply must use that released position.
 const V0141_PROTOCOL_VERSION: u32 = 17;

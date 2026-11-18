@@ -54,6 +54,7 @@ mod preview;
 mod search;
 pub(crate) mod session_menu;
 mod settings;
+pub(crate) use settings::THEME_FOLLOW_ROWS;
 mod switcher;
 
 #[cfg(test)]
@@ -2677,6 +2678,12 @@ pub struct App {
     pane_appearance: crate::terminal::appearance::PaneAppearance,
     /// Last foreground-client palette used to resolve the virtual Terminal theme.
     probed_appearance: Option<crate::terminal::appearance::PaneAppearance>,
+    /// Host colors from the foreground display. Pane queries follow these;
+    /// UI derivation uses a copy; unreported colors remain absent for panes.
+    pub(crate) host_terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
+    /// Runtime-only theme selected by `theme_follow`. `config.theme` remains
+    /// the saved manual preference.
+    followed_theme: Option<String>,
     /// Built-in, installed, and virtual themes in Settings display order.
     /// Loaded from the shared home-level `themes/` directory; rendering reads
     /// this in-memory snapshot and never touches the filesystem.
@@ -3576,6 +3583,8 @@ impl App {
             theme,
             pane_appearance,
             probed_appearance: None,
+            host_terminal_colors: None,
+            followed_theme: None,
             theme_registry,
             catalog,
             config,
@@ -4350,6 +4359,8 @@ impl App {
             theme,
             pane_appearance,
             probed_appearance: None,
+            host_terminal_colors: None,
+            followed_theme: None,
             theme_registry,
             catalog,
             config,
@@ -4722,33 +4733,144 @@ impl App {
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.
-    pub fn apply_terminal_colors(&mut self, colors: &crate::terminal::theme_probe::TerminalColors) {
-        self.probed_appearance =
-            Some(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
-        let derived = crate::ui::theme::Theme::from_terminal(colors);
-        self.set_effective_theme("terminal", derived);
+    ///
+    /// Terminal derives UI accents and selection layers from the probe while
+    /// preserving Reset primary backgrounds. A manual theme is left alone
+    /// unless `theme_follow.auto_switch` selects a known theme. Pane queries
+    /// retain the actual host colors, independently of UI compatibility defaults.
+    pub fn apply_terminal_colors(
+        &mut self,
+        colors: &crate::terminal::theme_probe::TerminalColors,
+    ) -> bool {
+        let host_changed = self.install_host_colors(colors);
+        let ui_changed = self.apply_host_ui(colors);
+        host_changed || ui_changed
     }
 
-    /// Install one resolved UI theme and broadcast its pane appearance through
-    /// the VT interface. Keeping both mutations here prevents config, Settings,
-    /// and terminal-probe paths from leaving child query state stale.
-    pub(crate) fn set_effective_theme(&mut self, theme_id: &str, mut theme: Theme) {
-        let appearance = child_appearance(
-            &self.theme_registry,
-            theme_id,
-            &theme,
-            self.probed_appearance,
-        );
+    fn install_host_colors(
+        &mut self,
+        colors: &crate::terminal::theme_probe::TerminalColors,
+    ) -> bool {
+        if self.host_terminal_colors.as_ref() == Some(colors) {
+            return false;
+        }
+        let appearance = crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors);
+        self.host_terminal_colors = Some(colors.clone());
+        self.probed_appearance = Some(appearance);
         self.pane_appearance = appearance;
         for pane in self.panes.values() {
             if let Ok(mut engine) = pane.engine.lock() {
                 engine.set_appearance(appearance);
             }
         }
+        true
+    }
+
+    /// Choose the UI theme for a host appearance without persisting over the
+    /// user's manual selection.
+    fn apply_host_ui(&mut self, colors: &crate::terminal::theme_probe::TerminalColors) -> bool {
+        if self.config.theme_follow.auto_switch {
+            let name = match crate::terminal::appearance::ColorScheme::from_terminal_colors(colors)
+            {
+                crate::terminal::appearance::ColorScheme::Dark => {
+                    self.config.theme_follow.dark.as_str()
+                }
+                crate::terminal::appearance::ColorScheme::Light => {
+                    self.config.theme_follow.light.as_str()
+                }
+            };
+            let name = name.to_string();
+            if let Some(theme) = self.theme_registry.theme(&name) {
+                let changed = self.followed_theme.as_deref() != Some(name.as_str());
+                self.followed_theme = Some(name.clone());
+                return self.set_effective_theme(&name, theme) || changed;
+            }
+        } else {
+            self.followed_theme = None;
+            return self.install_configured_theme(colors);
+        }
+        if self.config.theme == "terminal" {
+            return self.set_effective_theme("terminal", Theme::from_terminal(colors));
+        }
+        false
+    }
+
+    fn install_configured_theme(
+        &mut self,
+        colors: &crate::terminal::theme_probe::TerminalColors,
+    ) -> bool {
+        let theme_id = self.config.theme.clone();
+        if theme_id == "terminal" {
+            return self.set_effective_theme("terminal", Theme::from_terminal(colors));
+        }
+        let Some(theme) = self.theme_registry.theme(&theme_id) else {
+            return false;
+        };
+        self.set_effective_theme(&theme_id, theme)
+    }
+
+    /// Drop host-derived pane colors for a display that explicitly has none.
+    ///
+    /// Child-set foreground and background stay in the terminal engine. The
+    /// saved theme is restored without writing an automatic follow choice.
+    pub(crate) fn clear_host_terminal_colors(&mut self) -> bool {
+        let had_host =
+            self.host_terminal_colors.take().is_some() || self.probed_appearance.take().is_some();
+        self.followed_theme = None;
+        let theme_id = self.config.theme.clone();
+        let restored = if theme_id == "terminal" {
+            self.set_effective_theme("terminal", Theme::terminal_native())
+        } else if let Some(theme) = self.theme_registry.theme(&theme_id) {
+            self.set_effective_theme(&theme_id, theme)
+        } else {
+            false
+        };
+        had_host || restored
+    }
+
+    pub(crate) fn effective_theme_id(&self) -> &str {
+        self.followed_theme
+            .as_deref()
+            .unwrap_or(self.config.theme.as_str())
+    }
+
+    /// Install one resolved UI theme. Host pane colors, once known, stay on
+    /// the host palette instead of being replaced by this theme's RGB.
+    pub(crate) fn set_effective_theme(&mut self, theme_id: &str, mut theme: Theme) -> bool {
+        if self
+            .followed_theme
+            .as_deref()
+            .is_some_and(|followed| followed != theme_id)
+        {
+            self.followed_theme = None;
+        }
+        if theme_id == "terminal" {
+            if let Some(colors) = self.host_terminal_colors.as_ref() {
+                theme = Theme::from_terminal(colors);
+            }
+        }
+        if self.host_terminal_colors.is_none() {
+            let appearance = child_appearance(
+                &self.theme_registry,
+                theme_id,
+                &theme,
+                self.probed_appearance,
+            );
+            self.pane_appearance = appearance;
+            for pane in self.panes.values() {
+                if let Ok(mut engine) = pane.engine.lock() {
+                    engine.set_appearance(appearance);
+                }
+            }
+        }
         if self.downsample {
             theme = theme.to_256();
         }
+        if self.theme == theme {
+            return false;
+        }
         self.theme = theme;
+        true
     }
 
     /// Set a sidebar's width, clamped to the supported range, and persist.
