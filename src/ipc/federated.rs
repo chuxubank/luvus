@@ -2264,6 +2264,18 @@ fn cache_dock_projection(
     }
 }
 
+/// Whether an editing dock query consumes `key`. Ctrl+U clears the query
+/// unless it is the configured prefix; the config is read only for that chord,
+/// so ordinary typing never touches the disk.
+fn dock_query_consumes(key: &KeyEvent) -> bool {
+    crate::app::dock_filter::query_text_char(key).is_some()
+        || matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace)
+        || (crate::app::dock_filter::is_query_clear(key)
+            && !crate::app::PrefixSpec::parse(&crate::config::load().prefix)
+                .unwrap_or_default()
+                .matches(key))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_dock_input<B: ratatui::backend::Backend<Error = std::io::Error> + std::io::Write>(
     message: &ClientMessage,
@@ -2836,12 +2848,7 @@ fn handle_dock_input<B: ratatui::backend::Backend<Error = std::io::Error> + std:
         (dock.navigation, message, dock.rect)
     {
         if dock.workspace_search.editing() {
-            let query_key = (!crate::app::PrefixSpec::parse(&crate::config::load().prefix)
-                .unwrap_or_default()
-                .matches(key)
-                && crate::app::dock_filter::is_query_clear(key))
-                || crate::app::dock_filter::query_text_char(key).is_some()
-                || matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace);
+            let query_key = dock_query_consumes(key);
             if query_key {
                 match crate::app::dock_filter::edit_query(&mut dock.workspace_search, key) {
                     crate::app::dock_filter::QueryEdit::Updated => {
@@ -2849,11 +2856,8 @@ fn handle_dock_input<B: ratatui::backend::Backend<Error = std::io::Error> + std:
                         locate_shell_search(dock, &rows, true, true);
                     }
                     crate::app::dock_filter::QueryEdit::Canceled => {
-                        dock.selected_hit = dock.search_origin.clone();
-                        dock.selected_workspace_id = dock.search_origin_id.clone();
-                        dock.search_miss = false;
                         let rows = visible_dock_rows(machines, active, dock);
-                        remember_dock_selection(dock, &rows);
+                        restore_canceled_shell_search(dock, &rows);
                     }
                     crate::app::dock_filter::QueryEdit::Committed
                     | crate::app::dock_filter::QueryEdit::Ignored => {}
@@ -2864,12 +2868,7 @@ fn handle_dock_input<B: ratatui::backend::Backend<Error = std::io::Error> + std:
             }
         }
         if dock.workspace_query.editing() {
-            let query_key = (!crate::app::PrefixSpec::parse(&crate::config::load().prefix)
-                .unwrap_or_default()
-                .matches(key)
-                && crate::app::dock_filter::is_query_clear(key))
-                || crate::app::dock_filter::query_text_char(key).is_some()
-                || matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace);
+            let query_key = dock_query_consumes(key);
             if query_key {
                 if !matches!(
                     crate::app::dock_filter::edit_query(&mut dock.workspace_query, key),
@@ -2884,7 +2883,6 @@ fn handle_dock_input<B: ratatui::backend::Backend<Error = std::io::Error> + std:
             }
         }
         if !rect.workspace_modal
-            && key.kind != KeyEventKind::Repeat
             && key.kind != KeyEventKind::Repeat
             && crate::app::dock_filter::is_list_search_key(key)
         {
@@ -3890,30 +3888,79 @@ fn visible_dock_rows(
     if !dock.workspace_query.active() {
         return rows;
     }
-    let query = dock.workspace_query.fuzzy();
-    rows.into_iter()
-        .filter(|row| match row {
-            MachineDockRow::LocalWorkspace(workspace)
-            | MachineDockRow::RemoteWorkspace(_, workspace) => {
-                shell_workspace_matches(&query, workspace)
-            }
-            MachineDockRow::LocalHeading | MachineDockRow::Machine(_) => true,
-        })
-        .collect()
+    filter_shell_workspace_rows(rows, &dock.workspace_query.fuzzy())
+}
+
+fn filter_shell_workspace_rows(
+    rows: Vec<MachineDockRow>,
+    query: &crate::search::FuzzyQuery,
+) -> Vec<MachineDockRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut index = 0;
+    while index < rows.len() {
+        if !matches!(
+            rows[index],
+            MachineDockRow::LocalWorkspace(_) | MachineDockRow::RemoteWorkspace(_, _)
+        ) {
+            out.push(rows[index].clone());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let remote = match &rows[index] {
+            MachineDockRow::RemoteWorkspace(endpoint, _) => Some(endpoint.clone()),
+            _ => None,
+        };
+        index += 1;
+        while index < rows.len() && same_workspace_run(&rows[index], remote.as_ref()) {
+            index += 1;
+        }
+        let group = &rows[start..index];
+        let order: Vec<(usize, bool)> = group
+            .iter()
+            .enumerate()
+            .map(|(offset, row)| (offset, shell_row_nested(row)))
+            .collect();
+        for (offset, _) in crate::search::project_workspace_order(&order, |offset| {
+            shell_row_workspace(&group[offset])
+                .is_some_and(|workspace| shell_workspace_matches(query, workspace))
+        }) {
+            out.push(group[offset].clone());
+        }
+    }
+    out
+}
+
+fn same_workspace_run(row: &MachineDockRow, remote: Option<&Endpoint>) -> bool {
+    match (row, remote) {
+        (MachineDockRow::LocalWorkspace(_), None) => true,
+        (MachineDockRow::RemoteWorkspace(endpoint, _), Some(expected)) => endpoint == expected,
+        _ => false,
+    }
+}
+
+fn shell_row_workspace(row: &MachineDockRow) -> Option<&protocol::ShellWorkspace> {
+    match row {
+        MachineDockRow::LocalWorkspace(workspace)
+        | MachineDockRow::RemoteWorkspace(_, workspace) => Some(workspace),
+        _ => None,
+    }
+}
+
+fn shell_row_nested(row: &MachineDockRow) -> bool {
+    shell_row_workspace(row).is_some_and(|workspace| workspace.nested)
 }
 
 fn shell_workspace_matches(
     query: &crate::search::FuzzyQuery,
     workspace: &protocol::ShellWorkspace,
 ) -> bool {
-    let mut fields = vec![
-        crate::search::PreparedText::new(&workspace.name),
-        crate::search::PreparedText::new(&workspace.cwd),
-    ];
-    if let Some(branch) = &workspace.branch {
-        fields.push(crate::search::PreparedText::new(branch));
-    }
-    crate::search::prepared_hit(query, &fields)
+    crate::search::prepared_workspace_hit(
+        query,
+        &workspace.name,
+        &workspace.cwd,
+        workspace.branch.as_deref(),
+    )
 }
 
 fn locate_shell_search(
@@ -3955,6 +4002,16 @@ fn shell_row_identity(row: &MachineDockRow) -> Option<String> {
         MachineDockRow::LocalWorkspace(ws) => Some(format!("local:{}", ws.id)),
         MachineDockRow::RemoteWorkspace(endpoint, ws) => Some(format!("{endpoint:?}:{}", ws.id)),
         _ => None,
+    }
+}
+
+fn restore_canceled_shell_search(dock: &mut DockState, rows: &[MachineDockRow]) {
+    dock.selected_hit = dock.search_origin.clone();
+    dock.selected_workspace_id = dock.search_origin_id.clone();
+    dock.search_miss = false;
+    remember_dock_selection(dock, rows);
+    if !dock.activation_blocked {
+        dock.navigation_reveal = true;
     }
 }
 
@@ -6485,17 +6542,25 @@ fn client_repeat_allowed(key: KeyEvent, dock: &DockState) -> bool {
     let navigation_open = dock.selector_open
         || dock.navigation.is_some()
         || matches!(dock.machine_popup, Some(MachinePopup::Menu { .. }));
-    navigation_open
-        && matches!(
-            key.code,
-            KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Home
-                | KeyCode::End
-                | KeyCode::Char('j' | 'k' | 'g' | 'G')
-        )
+    if !navigation_open {
+        return false;
+    }
+    if matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Char('j' | 'k' | 'g' | 'G')
+    ) {
+        return true;
+    }
+    let editing = dock.workspace_search.editing() || dock.workspace_query.editing();
+    editing
+        && (key.code == KeyCode::Backspace
+            || crate::app::dock_filter::query_text_char(&key).is_some())
 }
 
 #[cfg(test)]
@@ -6823,6 +6888,43 @@ mod tests {
         assert!(machine_can_disconnect(&MachineState::Reconnecting {
             at: Instant::now()
         }));
+    }
+
+    #[test]
+    fn dock_query_repeats_text_and_backspace_but_not_activation() {
+        let mut dock = DockState {
+            navigation: Some(0),
+            ..DockState::default()
+        };
+        let phase = |dock: &mut DockState, code| {
+            let key = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+            dock.key_owners
+                .insert(federated_key_identity(key), KeyOwner::Client);
+            owned_key_phase(&ClientMessage::Key(key), dock, &Endpoint::Local)
+        };
+        dock.workspace_search.begin();
+        assert_eq!(
+            phase(&mut dock, KeyCode::Char('x')),
+            OwnedKeyPhase::ClientRepeat
+        );
+        assert_eq!(
+            phase(&mut dock, KeyCode::Backspace),
+            OwnedKeyPhase::ClientRepeat
+        );
+        assert_eq!(phase(&mut dock, KeyCode::Enter), OwnedKeyPhase::Consume);
+        dock.workspace_search.commit();
+        assert_eq!(
+            phase(&mut dock, KeyCode::Down),
+            OwnedKeyPhase::ClientRepeat,
+            "navigation repeats stay available outside query editing"
+        );
+        assert_eq!(phase(&mut dock, KeyCode::Char('x')), OwnedKeyPhase::Consume);
+        assert_eq!(phase(&mut dock, KeyCode::Backspace), OwnedKeyPhase::Consume);
+        dock.workspace_query.begin();
+        assert_eq!(
+            phase(&mut dock, KeyCode::Char('你')),
+            OwnedKeyPhase::ClientRepeat
+        );
     }
 
     #[test]
@@ -7388,6 +7490,126 @@ mod tests {
             "search cannot select a workspace the filter hid"
         );
         assert!(dock.selected_hit.is_none());
+    }
+
+    #[test]
+    fn federated_dock_finds_later_dense_path_alignments() {
+        let mut machine = machine_with_sessions("box", &["default"], MachineState::Online);
+        let mut service = shell_workspace(0, "service");
+        service.cwd = "/backup/build/service".into();
+        let mut sparse = shell_workspace(1, "other");
+        sparse.cwd = "/backup/b12l34d/other".into();
+        machine.runtime.workspaces = vec![service, sparse];
+        let machines = HashMap::from([("box".into(), machine)]);
+        let mut dock = DockState::default();
+        dock.workspace_query.begin();
+        dock.workspace_query.append("bld");
+        dock.workspace_query.commit();
+        let rows = visible_dock_rows(&machines, &Endpoint::Local, &dock);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, MachineDockRow::RemoteWorkspace(..)))
+                .count(),
+            1,
+            "keep the dense match but not the sparse one"
+        );
+        dock.workspace_search.begin();
+        dock.workspace_search.append("bld");
+        locate_shell_search(&mut dock, &rows, true, true);
+        assert_eq!(
+            dock.selected_hit,
+            Some(DockHit::RemoteWorkspace(
+                Endpoint::Remote {
+                    machine_id: "box".into(),
+                    session: "default".into()
+                },
+                0,
+            )),
+        );
+    }
+
+    #[test]
+    fn federated_filter_keeps_the_parent_of_a_matching_worktree() {
+        let parent = shell_workspace(0, "repo");
+        let mut child = shell_workspace(1, "repo-feature");
+        child.nested = true;
+        let other = shell_workspace(2, "other");
+        let remote_parent = shell_workspace(0, "remote-repo");
+        let mut remote_child = shell_workspace(1, "remote-feature");
+        remote_child.nested = true;
+        let mut machine = machine_with_sessions("box", &["default"], MachineState::Online);
+        machine.runtime.workspaces = vec![remote_parent, remote_child];
+        let machines = HashMap::from([("box".into(), machine)]);
+        let mut dock = DockState {
+            local_workspaces: vec![other, parent, child],
+            ..DockState::default()
+        };
+        dock.workspace_query.begin();
+        dock.workspace_query.append("feature");
+        dock.workspace_query.commit();
+        let rows = visible_dock_rows(&machines, &Endpoint::Local, &dock);
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                MachineDockRow::LocalWorkspace(workspace)
+                | MachineDockRow::RemoteWorkspace(_, workspace) => {
+                    Some((workspace.name.as_str(), workspace.nested))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("repo", false),
+                ("repo-feature", true),
+                ("remote-repo", false),
+                ("remote-feature", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn federated_search_cancel_reveals_the_restored_origin() {
+        let mut dock = DockState {
+            local_workspaces: (0..8)
+                .map(|index| shell_workspace(index, &format!("row{index}")))
+                .collect(),
+            navigation: Some(0),
+            selected_hit: Some(DockHit::LocalWorkspace(0)),
+            selected_workspace_id: Some("local:row0-0".into()),
+            scroll: 0,
+            ..DockState::default()
+        };
+        let rows = visible_dock_rows(&HashMap::new(), &Endpoint::Local, &dock);
+        dock.search_origin = dock.selected_hit.clone();
+        dock.search_origin_id = dock.selected_workspace_id.clone();
+        dock.workspace_search.begin();
+        dock.workspace_search.append("row7");
+        locate_shell_search(&mut dock, &rows, true, true);
+        reveal_workspace(&rows, &Endpoint::Local, &mut dock, 2, false);
+        let match_scroll = dock.scroll;
+        assert!(match_scroll > 1, "the off-screen match moves the viewport");
+        assert!(
+            !dock.navigation_reveal,
+            "painting consumes the search reveal"
+        );
+
+        restore_canceled_shell_search(&mut dock, &rows);
+        assert_eq!(dock.navigation, Some(1), "origin is the first workspace");
+        assert!(
+            dock.navigation_reveal,
+            "canceling search must reveal the restored origin"
+        );
+        reveal_workspace(&rows, &Endpoint::Local, &mut dock, 2, false);
+        assert!(dock.scroll <= 1 && dock.scroll < match_scroll);
+
+        dock.scroll = 3;
+        reveal_workspace(&rows, &Endpoint::Local, &mut dock, 2, false);
+        assert_eq!(
+            dock.scroll, 3,
+            "wheel scrolling stays until the next reveal"
+        );
     }
 
     #[test]

@@ -772,7 +772,7 @@ impl App {
                 return true;
             }
             match key.code {
-                KeyCode::Esc => self.file_tree.clear_filter(),
+                KeyCode::Esc => self.clear_retained_file_filter(),
                 KeyCode::Tab => {
                     filter.editing = false;
                     self.note_file_search_move();
@@ -887,7 +887,7 @@ impl App {
                     self.file_search_miss = false;
                     self.file_located = None;
                 } else if self.file_tree.filter.is_some() {
-                    self.file_tree.clear_filter();
+                    self.clear_retained_file_filter();
                 } else {
                     self.files_focused = false;
                 }
@@ -1026,8 +1026,16 @@ impl App {
         if let Some(search) = self.search.as_mut() {
             search.file_action = None;
         } else {
-            self.file_tree.clear_filter();
+            self.clear_retained_file_filter();
         }
+    }
+
+    fn clear_retained_file_filter(&mut self) {
+        if self.file_tree.filter.is_none() {
+            return;
+        }
+        self.file_tree.clear_filter();
+        self.note_file_search_move();
     }
 
     #[cfg(test)]
@@ -1041,7 +1049,7 @@ impl App {
         if self.search.is_some() && !self.finish_search_file_action(&menu.path) {
             return;
         }
-        self.file_tree.clear_filter();
+        self.clear_retained_file_filter();
         // New entries land *inside* a folder, or beside a clicked file.
         let dir = if menu.is_dir {
             menu.path.clone()
@@ -1926,6 +1934,95 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn retained_filter(app: &mut App, path: PathBuf) {
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE));
+        let filter = app.file_tree.filter.as_mut().unwrap();
+        filter.loading = false;
+        filter.rows = vec![crate::files::VisibleRow {
+            path,
+            name: "match".into(),
+            depth: 1,
+            is_dir: false,
+            expanded: false,
+            loading: false,
+        }];
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn canceling_a_file_menu_does_not_adopt_a_replacement_row() {
+        let _env = crate::persist::test_env("files-menu-cancel-selection");
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let root = seed_keyboard_tree(&mut app);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let notes = root.join("notes.txt");
+        app.handle_file_tree_key(key(KeyCode::Down));
+        app.handle_file_tree_key(key(KeyCode::Down));
+        assert_eq!(app.file_located.as_deref(), Some(notes.as_path()));
+        app.handle_file_tree_key(key(KeyCode::Char('a')));
+        assert!(app.file_menu.is_some());
+        app.file_tree.apply_dir(
+            root.clone(),
+            vec![
+                crate::files::Entry {
+                    name: "src".into(),
+                    is_dir: true,
+                },
+                crate::files::Entry {
+                    name: "README.md".into(),
+                    is_dir: false,
+                },
+                crate::files::Entry {
+                    name: "replacement.txt".into(),
+                    is_dir: false,
+                },
+            ],
+        );
+        app.handle_file_menu_key(key(KeyCode::Esc));
+        assert!(app.file_menu.is_none());
+        assert_eq!(app.file_located.as_deref(), Some(notes.as_path()));
+        app.handle_file_tree_key(key(KeyCode::Enter));
+        app.handle_file_tree_key(key(KeyCode::Char('a')));
+        assert!(app.files_focused);
+        assert!(app.file_menu.is_none());
+        assert!(!matches!(
+            app.views.get(&app.layout().focus),
+            Some(crate::app::ViewKind::File(_))
+        ));
+    }
+
+    #[test]
+    fn clearing_a_retained_file_filter_follows_the_restored_row() {
+        let _env = crate::persist::test_env("files-filter-restored-path");
+        let mut hidden = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let root = seed_keyboard_tree(&mut hidden);
+        let nested = root.join("src/main.rs");
+        retained_filter(&mut hidden, nested);
+        hidden.handle_file_tree_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(hidden.file_tree.filter.is_none());
+        assert_eq!(hidden.file_tree.cursor, 0);
+        assert_eq!(
+            hidden.file_located.as_deref(),
+            Some(root.join("src").as_path())
+        );
+        hidden.handle_file_tree_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(hidden.file_tree.visible_rows()[0].expanded);
+        assert!(hidden.file_menu.is_none());
+
+        let mut visible = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let root = seed_keyboard_tree(&mut visible);
+        retained_filter(&mut visible, root.join("README.md"));
+        visible.handle_file_tree_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(visible.file_tree.cursor, 0);
+        assert_eq!(
+            visible.file_located.as_deref(),
+            Some(root.join("src").as_path())
+        );
+        visible.handle_file_tree_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(visible.file_tree.visible_rows()[0].expanded);
+        assert_eq!(visible.file_tree.cursor, 0);
+    }
+
     #[test]
     fn files_search_locates_visible_directories_by_relative_path_and_reveals() {
         let _env = crate::persist::test_env("files-search-directories");
@@ -2362,9 +2459,10 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let tabs_before = app.workspaces[app.active_ws].tabs.len();
 
-        // `cat` stands in for an editor: a real program launched with the file as
-        // a literal argv element (present on every unix CI runner).
-        app.open_file_in_editor(file.clone(), "cat");
+        // A real program launched with the file as a literal argv element, so
+        // the pane is a true PTY: `cat` on unix, `cmd /c type` on Windows.
+        let editor = if cfg!(windows) { "cmd /c type" } else { "cat" };
+        app.open_file_in_editor(file.clone(), editor);
 
         assert_eq!(
             app.workspaces[app.active_ws].tabs.len(),
