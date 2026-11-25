@@ -251,11 +251,25 @@ pub(super) enum ClientExit {
     SwitchSession(String),
 }
 
+#[derive(Clone, Default)]
+struct HostColorCache {
+    generation: u64,
+    colors: Option<crate::terminal::theme_probe::TerminalColors>,
+}
+
+impl HostColorCache {
+    fn store(&mut self, colors: Option<crate::terminal::theme_probe::TerminalColors>) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.colors = colors;
+        self.generation
+    }
+}
+
 #[derive(Default)]
 struct ClientInput {
     route: InputRoute,
     started: bool,
-    colors: std::sync::Arc<std::sync::Mutex<Option<crate::terminal::theme_probe::TerminalColors>>>,
+    colors: std::sync::Arc<std::sync::Mutex<HostColorCache>>,
     graphics_supported: bool,
     #[cfg(windows)]
     windows_input_mode: Option<crate::terminal::host_input::WindowsInputModeGuard>,
@@ -334,12 +348,9 @@ where
     if probe_terminal && !input.started {
         let probe = crate::terminal::theme_probe::probe();
         if let Ok(mut colors) = input.colors.lock() {
-            *colors = probe.colors;
+            colors.store(probe.colors);
         }
-        protocol::write_message(
-            &mut writer,
-            &ClientMessage::TerminalColors(handshake_terminal_colors(&input.colors)),
-        )?;
+        write_cached_terminal_colors(&input.route, &mut writer)?;
         pending = probe.pending;
         #[cfg(not(windows))]
         {
@@ -347,10 +358,7 @@ where
         }
     } else if probe_terminal {
         // The sole input reader already owns stdin after initial attach.
-        protocol::write_message(
-            &mut writer,
-            &ClientMessage::TerminalColors(handshake_terminal_colors(&input.colors)),
-        )?;
+        write_cached_terminal_colors(&input.route, &mut writer)?;
     }
     if !input.started {
         let (graphics, extra) = crate::terminal::theme_probe::probe_kitty_graphics();
@@ -555,7 +563,7 @@ struct InputRoute {
     writer: Arc<Mutex<RouteWriter>>,
     writer_ready: Arc<Condvar>,
     closed: Arc<AtomicBool>,
-    colors: std::sync::Arc<std::sync::Mutex<Option<crate::terminal::theme_probe::TerminalColors>>>,
+    colors: std::sync::Arc<std::sync::Mutex<HostColorCache>>,
 }
 
 #[derive(Default)]
@@ -566,6 +574,8 @@ struct RouteWriter {
     /// `writing == false` instead means an intentional handoff gap.
     writing: bool,
     pending_clipboard_ack: Option<ClientMessage>,
+    pending_terminal_colors: Option<(u64, Option<crate::terminal::theme_probe::TerminalColors>)>,
+    delivered_terminal_colors: u64,
 }
 
 impl InputRoute {
@@ -603,12 +613,14 @@ impl InputRoute {
         }
     }
 
-    fn finish_write(&self, generation: u64, mut writer: Box<dyn Write + Send>) {
+    /// Write every clipboard receipt queued while this generation owned the
+    /// writer, then put the writer back. Returns false when the route moved on.
+    fn release_writer(&self, generation: u64, mut writer: Box<dyn Write + Send>) -> bool {
         loop {
             let pending = {
                 let mut route = self.writer.lock().unwrap_or_else(|e| e.into_inner());
                 if route.generation != generation || self.closed.load(Ordering::Acquire) {
-                    return;
+                    return false;
                 }
                 if let Some(pending) = route.pending_clipboard_ack.take() {
                     pending
@@ -616,13 +628,19 @@ impl InputRoute {
                     route.active = Some(writer);
                     route.writing = false;
                     self.writer_ready.notify_all();
-                    return;
+                    return true;
                 }
             };
             if protocol::write_message(&mut writer, &pending).is_err() {
                 self.retire_failed_write(generation);
-                return;
+                return false;
             }
+        }
+    }
+
+    fn finish_write(&self, generation: u64, writer: Box<dyn Write + Send>) {
+        if self.release_writer(generation, writer) {
+            self.flush_pending_terminal_colors();
         }
     }
 
@@ -637,6 +655,7 @@ impl InputRoute {
     }
 
     fn replace(&self, writer: Option<Box<dyn Write + Send>>) {
+        let installed = writer.is_some();
         let retired = {
             let mut route = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             route.generation = route.generation.wrapping_add(1);
@@ -647,6 +666,9 @@ impl InputRoute {
             retired
         };
         drop(retired);
+        if installed {
+            self.flush_pending_terminal_colors();
+        }
     }
 
     fn close(&self) {
@@ -662,6 +684,127 @@ impl InputRoute {
             return true;
         };
         self.send_message(message)
+    }
+
+    /// Unix input reports host colors. Windows tests call it directly; the
+    /// Windows host-input loop does not.
+    #[cfg(any(not(windows), test))]
+    fn publish_terminal_colors(
+        &self,
+        generation: u64,
+        colors: Option<crate::terminal::theme_probe::TerminalColors>,
+    ) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        {
+            let mut route = self
+                .writer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if generation < route.delivered_terminal_colors
+                || route
+                    .pending_terminal_colors
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending > generation)
+            {
+                return true;
+            }
+            if generation == route.delivered_terminal_colors
+                && route.pending_terminal_colors.is_none()
+            {
+                return true;
+            }
+            route.pending_terminal_colors = Some((generation, colors));
+        }
+        self.flush_pending_terminal_colors();
+        true
+    }
+
+    fn note_delivered_terminal_colors(&self, generation: u64) {
+        let mut route = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation > route.delivered_terminal_colors {
+            route.delivered_terminal_colors = generation;
+        }
+    }
+
+    fn flush_pending_terminal_colors(&self) {
+        let mut held: Option<(u64, Box<dyn Write + Send>)> = None;
+        loop {
+            let next = {
+                let mut route = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if self.closed.load(Ordering::Acquire) {
+                    if let Some((generation, writer)) = held.take() {
+                        if route.generation == generation {
+                            route.active = Some(writer);
+                            route.writing = false;
+                            self.writer_ready.notify_all();
+                        }
+                    }
+                    return;
+                }
+                let Some((color_generation, colors)) = route.pending_terminal_colors.clone() else {
+                    let restore = held.take();
+                    drop(route);
+                    if let Some((generation, writer)) = restore {
+                        if self.release_writer(generation, writer) {
+                            continue;
+                        }
+                    }
+                    return;
+                };
+                if color_generation <= route.delivered_terminal_colors {
+                    route.pending_terminal_colors = None;
+                    continue;
+                }
+                let writer = if let Some((generation, writer)) = held.take() {
+                    if route.generation != generation {
+                        return;
+                    }
+                    writer
+                } else if let Some(writer) = route.active.take() {
+                    route.writing = true;
+                    writer
+                } else {
+                    return;
+                };
+                route.pending_terminal_colors = None;
+                (route.generation, color_generation, colors, writer)
+            };
+            let (route_generation, color_generation, colors, mut writer) = next;
+            if protocol::write_message(&mut writer, &ClientMessage::TerminalColors(colors.clone()))
+                .is_ok()
+            {
+                {
+                    let mut route = self
+                        .writer
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if route.generation == route_generation
+                        && color_generation > route.delivered_terminal_colors
+                    {
+                        route.delivered_terminal_colors = color_generation;
+                    }
+                }
+                held = Some((route_generation, writer));
+            } else {
+                self.retire_failed_write(route_generation);
+                let mut route = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if route.pending_terminal_colors.is_none() {
+                    route.pending_terminal_colors = Some((color_generation, colors));
+                }
+                return;
+            }
+        }
     }
 
     fn send_message(&self, message: ClientMessage) -> bool {
@@ -775,19 +918,35 @@ fn input_loop(
             partial,
             |event| route.send(event),
             |colors| {
-                if let Ok(mut cached) = route.colors.lock() {
-                    *cached = Some(colors.clone());
-                }
-                route.send_message(ClientMessage::TerminalColors(Some(colors)))
+                let generation = route
+                    .colors
+                    .lock()
+                    .ok()
+                    .map(|mut cached| cached.store(Some(colors.clone())))
+                    .unwrap_or(0);
+                route.publish_terminal_colors(generation, Some(colors))
             },
         );
     }
 }
 
 fn handshake_terminal_colors(
-    colors: &std::sync::Arc<std::sync::Mutex<Option<crate::terminal::theme_probe::TerminalColors>>>,
-) -> Option<crate::terminal::theme_probe::TerminalColors> {
-    colors.lock().ok().and_then(|colors| colors.clone())
+    colors: &std::sync::Arc<std::sync::Mutex<HostColorCache>>,
+) -> (u64, Option<crate::terminal::theme_probe::TerminalColors>) {
+    colors
+        .lock()
+        .map(|colors| (colors.generation, colors.colors.clone()))
+        .unwrap_or_default()
+}
+
+fn write_cached_terminal_colors<W: std::io::Write>(
+    route: &InputRoute,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let (generation, colors) = handshake_terminal_colors(&route.colors);
+    protocol::write_message(writer, &ClientMessage::TerminalColors(colors))?;
+    route.note_delivered_terminal_colors(generation);
+    Ok(())
 }
 
 fn hello_message(cols: u16, rows: u16) -> ClientMessage {
@@ -2133,14 +2292,7 @@ mod tests {
 
     #[test]
     fn reconnect_handshake_uses_the_latest_cached_host_colors() {
-        let cached = std::sync::Arc::new(std::sync::Mutex::new(Some(
-            crate::terminal::theme_probe::TerminalColors {
-                fg: [1, 1, 1],
-                bg: [2, 2, 2],
-                palette: [[0; 3]; 16],
-                palette_mask: 0,
-            },
-        )));
+        let cached = std::sync::Arc::new(std::sync::Mutex::new(super::HostColorCache::default()));
         let route = super::InputRoute {
             colors: std::sync::Arc::clone(&cached),
             ..super::InputRoute::default()
@@ -2152,9 +2304,47 @@ mod tests {
             palette_mask: 1,
         };
         if let Ok(mut slot) = route.colors.lock() {
-            *slot = Some(latest.clone());
+            slot.store(Some(latest.clone()));
         }
-        assert_eq!(super::handshake_terminal_colors(&cached), Some(latest));
+        assert_eq!(super::handshake_terminal_colors(&cached).1, Some(latest));
+    }
+
+    #[test]
+    fn handoff_keeps_the_latest_terminal_colors_until_the_writer_returns() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let colors = |bg: u8| crate::terminal::theme_probe::TerminalColors {
+            fg: [9, 9, 9],
+            bg: [bg, bg, bg],
+            palette: [[0; 3]; 16],
+            palette_mask: 0,
+        };
+        let route = super::InputRoute::default();
+        let first = Capture::default();
+        route.replace(Some(Box::new(first.clone())));
+        assert!(route.publish_terminal_colors(1, Some(colors(1))));
+        route.replace(None);
+        assert!(route.publish_terminal_colors(2, Some(colors(2))));
+        assert!(route.publish_terminal_colors(3, Some(colors(3))));
+        assert!(route.publish_terminal_colors(2, Some(colors(2))));
+        let second = Capture::default();
+        route.replace(Some(Box::new(second.clone())));
+        let bytes = second.0.lock().unwrap().clone();
+        let mut cursor = std::io::Cursor::new(bytes);
+        match super::protocol::read_message::<_, ClientMessage>(&mut cursor).unwrap() {
+            ClientMessage::TerminalColors(Some(reported)) => assert_eq!(reported.bg, [3, 3, 3]),
+            _ => panic!("expected the newest host colors"),
+        }
+        assert_eq!(cursor.position(), cursor.get_ref().len() as u64);
     }
 
     /// Subprocess entry point for `real_server_accepts_a_terminal_palette`.
@@ -2254,6 +2444,72 @@ mod render_tests {
             }
             assert_eq!(cursor.position(), cursor.get_ref().len() as u64);
         }
+    }
+
+    #[test]
+    fn color_flush_sends_the_queued_clipboard_receipt_without_another_key() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct HeldWriter {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for HeldWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let route = InputRoute::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        route.replace(Some(Box::new(HeldWriter {
+            bytes: bytes.clone(),
+            entered: Some(entered_tx),
+            release: release_rx,
+        })));
+        let generation = route.generation();
+        let publishing = route.clone();
+        let publish = thread::spawn(move || {
+            publishing.publish_terminal_colors(
+                1,
+                Some(crate::terminal::theme_probe::TerminalColors {
+                    fg: [1, 1, 1],
+                    bg: [2, 2, 2],
+                    palette: [[0; 3]; 16],
+                    palette_mask: 0,
+                }),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        route.send_if_generation(generation, ClientMessage::ClipboardSucceeded { receipt: 9 });
+        release_tx.send(()).unwrap();
+        assert!(publish.join().unwrap());
+        let captured = bytes.lock().unwrap().clone();
+        let mut cursor = std::io::Cursor::new(captured);
+        assert!(matches!(
+            protocol::read_message(&mut cursor).unwrap(),
+            ClientMessage::TerminalColors(Some(colors)) if colors.bg == [2, 2, 2]
+        ));
+        assert!(
+            matches!(
+                protocol::read_message(&mut cursor).unwrap(),
+                ClientMessage::ClipboardSucceeded { receipt: 9 }
+            ),
+            "a clipboard receipt queued during the color write must leave with that writer"
+        );
+        assert_eq!(cursor.position(), cursor.get_ref().len() as u64);
     }
 
     #[test]
