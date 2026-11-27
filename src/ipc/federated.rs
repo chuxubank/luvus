@@ -6986,6 +6986,7 @@ mod tests {
             cursor: None,
             cursor_visible: false,
             cursor_style: protocol::HostCursorStyle::default(),
+            graphics: Vec::new(),
         };
         assert!(resample_dock_base_from_diff(&mut dock, &diff, true));
         assert_eq!(dock.owner_base.as_ref().map(|cell| cell.bg), Some(light));
@@ -7025,6 +7026,7 @@ mod tests {
             cursor: None,
             cursor_visible: false,
             cursor_style: protocol::HostCursorStyle::default(),
+            graphics: Vec::new(),
         };
         assert!(!resample_dock_base_from_diff(&mut dock, &diff, true));
         assert_eq!(
@@ -7067,6 +7069,7 @@ mod tests {
             cursor: None,
             cursor_visible: false,
             cursor_style: protocol::HostCursorStyle::default(),
+            graphics: Vec::new(),
         };
         assert!(!resample_dock_base_from_diff(&mut dock, &diff, true));
         assert_eq!(
@@ -7116,6 +7119,7 @@ mod tests {
             cursor: None,
             cursor_visible: false,
             cursor_style: protocol::HostCursorStyle::default(),
+            graphics: Vec::new(),
         };
         cache_dock_projection(&mut dock, &frame, true, true);
         assert_eq!(

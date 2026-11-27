@@ -320,21 +320,6 @@ impl ColorReplyFilter {
             })
     }
 
-    /// Move an unambiguous color introducer into the reply body without
-    /// emitting the keys that carried it.
-    fn commit_prefix_as_reply(&mut self, now: Instant) {
-        self.reply_prefix = std::mem::take(&mut self.bytes);
-        let escape = self.reply_prefix.last() == Some(&0x1b);
-        self.reply_body.clear();
-        self.pending.clear();
-        self.state = ReplyState::Reply {
-            escape,
-            until: now + REPLY_MAX_DURATION,
-            kind: ReportKind::Color,
-        };
-        self.deadline = Some(now + REPLY_IDLE_TIMEOUT);
-    }
-
     /// A poll timeout. ESC ] is not replayed when the body has not arrived yet;
     /// the wait extends to the reply idle limit. A lone Esc is released.
     fn expire_deadline(&mut self, now: Instant) -> DecodedEvents {
